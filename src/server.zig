@@ -29,6 +29,7 @@ pub const Listener = struct {
             NetworkDown,
             Unreachable,
             Unexpected,
+            WouldBlock,
         };
 
         pub fn read(self: *Connection, buf: []u8) RwError!usize {
@@ -39,6 +40,7 @@ pub const Listener = struct {
                     .INTR => continue,
                     .CONNRESET, .PIPE => return RwError.ConnectionReset,
                     .NETDOWN => return RwError.NetworkDown,
+                    .AGAIN => return RwError.WouldBlock,
                     .TIMEDOUT,
                     .HOSTUNREACH,
                     .NETUNREACH,
@@ -67,6 +69,7 @@ pub const Listener = struct {
                     .INTR => continue,
                     .CONNRESET, .PIPE => return RwError.ConnectionReset,
                     .NETDOWN => return RwError.NetworkDown,
+                    .AGAIN => return RwError.WouldBlock,
                     .TIMEDOUT,
                     .HOSTUNREACH,
                     .NETUNREACH,
@@ -630,7 +633,7 @@ fn read_request(
     // First Read
     var done, const deadline = first_read: {
         const idle_deadline = self.make_deadline(self.idle_timeout);
-        var chunk = self.read(
+        var chunk = self.read_buffered(
             conn,
             self.parser.bytes_required(),
             idle_deadline,
@@ -660,7 +663,7 @@ fn read_request(
     // Subsequent reads
     while (!done) {
         const needed = self.parser.bytes_required();
-        const chunk = self.read(conn, needed, deadline) catch |e| {
+        const chunk = self.read_buffered(conn, needed, deadline) catch |e| {
             const err = switch (e) {
                 error.ReadTimeout, error.OutOfMemory, error.Unexpected => |e2| e2,
                 error.ConnectionReset,
@@ -700,9 +703,13 @@ fn handle_parse_err(err: protocol.ParseError, diag: *ConnectionDiagnostics) Pars
 const ReadError = error{
     ReadTimeout,
     OutOfMemory,
-} || Listener.Connection.RwError;
+    ConnectionReset,
+    NetworkDown,
+    Unreachable,
+    Unexpected,
+};
 
-fn read(
+fn read_buffered(
     self: *Self,
     conn: *Listener.Connection,
     size: usize,
@@ -716,22 +723,40 @@ fn read(
             .revents = 0,
         };
 
-        const poll_result: i32 = while (true) {
-            const timeout = self.timeout_remaining_ms(deadline) orelse return error.ReadTimeout;
-            const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
-            switch (linux.errno(poll_rc)) {
-                .SUCCESS => break @intCast(poll_rc),
-                .NOMEM => return error.OutOfMemory,
-                .INTR => continue,
-                else => |e| unexpected_syscall("poll", e),
-            }
+        var n = conn.read(self.read_buf.write()) catch |e| switch (e) {
+            error.ConnectionReset,
+            error.NetworkDown,
+            error.Unreachable,
+            error.Unexpected,
+            => |err| return err,
+            error.WouldBlock => 0,
         };
 
-        if (poll_result == 0) {
-            return error.ReadTimeout;
-        }
+        if (n == 0) {
+            const poll_result: i32 = while (true) {
+                const timeout = self.timeout_remaining_ms(deadline) orelse return error.ReadTimeout;
+                const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
+                switch (linux.errno(poll_rc)) {
+                    .SUCCESS => break @intCast(poll_rc),
+                    .NOMEM => return error.OutOfMemory,
+                    .INTR => continue,
+                    else => |e| unexpected_syscall("poll", e),
+                }
+            };
 
-        const n = try conn.read(self.read_buf.write());
+            if (poll_result == 0) {
+                return error.ReadTimeout;
+            }
+
+            n = conn.read(self.read_buf.write()) catch |e| switch (e) {
+                error.ConnectionReset,
+                error.NetworkDown,
+                error.Unreachable,
+                error.Unexpected,
+                => |err| return err,
+                error.WouldBlock => unexpected_syscall("read", linux.E.AGAIN),
+            };
+        }
         self.read_buf.mark_written(n);
         chunk = self.read_buf.contents(size);
     }
@@ -746,7 +771,11 @@ fn timeout_remaining_ms(self: Self, deadline: Io.Clock.Timestamp) ?i32 {
 const WriteError = error{
     WriteTimeout,
     OutOfMemory,
-} || Listener.Connection.RwError;
+    ConnectionReset,
+    NetworkDown,
+    Unreachable,
+    Unexpected,
+};
 
 /// Shuts down the write side of the connection. Caller must close after calling this.
 fn write_drain(self: *Self, conn: *Listener.Connection, buf: []const u8) void {
@@ -786,14 +815,30 @@ fn write_all(
     buf: []const u8,
 ) WriteError!void {
     const deadline = self.make_deadline(self.write_timeout);
+    try self.write_all_poll(conn, buf, deadline);
+}
 
+fn write_all_poll(
+    self: *Self,
+    conn: *Listener.Connection,
+    buf: []const u8,
+    deadline: Io.Clock.Timestamp,
+) WriteError!void {
     var pollfd = linux.pollfd{
         .fd = conn.sock_fd,
         .events = linux.POLL.OUT,
         .revents = 0,
     };
 
-    var i: usize = 0;
+    var i: usize = conn.write(buf) catch |e| switch (e) {
+        error.WouldBlock => 0,
+        error.ConnectionReset,
+        error.NetworkDown,
+        error.Unreachable,
+        error.Unexpected,
+        => |err| return err,
+    };
+
     while (i < buf.len) {
         const poll_result: i32 = while (true) {
             const timeout = self.timeout_remaining_ms(deadline) orelse return error.WriteTimeout;
@@ -809,7 +854,14 @@ fn write_all(
             return error.WriteTimeout;
         }
 
-        const n = try conn.write(buf[i..]);
+        const n = conn.write(buf[i..]) catch |e| switch (e) {
+            error.WouldBlock => unexpected_syscall("write", linux.E.AGAIN),
+            error.ConnectionReset,
+            error.NetworkDown,
+            error.Unreachable,
+            error.Unexpected,
+            => |err| return err,
+        };
         i += n;
     }
 }
