@@ -12,3 +12,7 @@ Other good candidates for optimization are eliminating intermediate buffers, for
 
 - Reading currently goes through a read buffer, then a parsing buffer, and then an allocation for the hashmap. The parsing buffer could hand over the buffer to the hashmap, and the read buffer could be used only for small request, while big requests bypass the read buffer after reading the frame.
 - Encoding and writing a get response allocates a new buffer to append a tiny frame. Instead, a vectored write could append the frame without requiring another allocation.
+
+## 2 Syscalls per read/write
+
+The naive implementation polled before each read or write. Considering that the most likely case is that data will be waiting on the receive/send kernel buffer, polling the first time wastes one syscall. Instead, now the system tries to read or write, and polls if WOULDBLOCK.
