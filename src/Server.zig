@@ -136,7 +136,7 @@ pub const Listener = struct {
     };
 
     fn bind(self: *Listener, addr: []const u8) BindError!void {
-        const socket_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        const socket_rc = syscall.socket(.Blocking);
         switch (linux.errno(socket_rc)) {
             .SUCCESS => self.sock_fd = @intCast(socket_rc),
             .ACCES => return BindError.PermissionDenied,
