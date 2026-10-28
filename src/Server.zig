@@ -14,6 +14,7 @@ const assert = debug.assert;
 const Clock = Io.Clock.awake;
 const BufMap = std.BufMap;
 const encode = protocol.encode;
+const syscall = @import("syscall.zig");
 
 const protocol = @import("protocol.zig");
 
@@ -52,7 +53,7 @@ pub const Listener = struct {
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| unexpected_syscall("read", e),
+                    => |e| syscall.unexpected_err("read", e),
                     else => |e| {
                         log_syscall_err("read", e);
                         return RwError.Unexpected;
@@ -81,7 +82,7 @@ pub const Listener = struct {
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| unexpected_syscall("write", e),
+                    => |e| syscall.unexpected_err("write", e),
                     else => |e| {
                         log_syscall_err("write", e);
                         return RwError.Unexpected;
@@ -107,7 +108,7 @@ pub const Listener = struct {
             const shut_rc = linux.shutdown(self.sock_fd, linux.SHUT.WR);
             switch (linux.errno(shut_rc)) {
                 .SUCCESS, .NOTCONN => {},
-                else => |e| unexpected_syscall("shutdown", e),
+                else => |e| syscall.unexpected_err("shutdown", e),
             }
         }
 
@@ -115,7 +116,7 @@ pub const Listener = struct {
             const rc = linux.close(self.sock_fd);
             switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| unexpected_syscall("close", e),
+                .BADF => |e| syscall.unexpected_err("close", e),
                 else => |e| log_syscall_err("close", e),
             }
             self.sock_fd = -1;
@@ -141,7 +142,7 @@ pub const Listener = struct {
             .ACCES => return BindError.PermissionDenied,
             .MFILE, .NFILE => return BindError.TooManyOpenFiles,
             .NOBUFS, .NOMEM => return BindError.InsufficientMemory,
-            else => |e| unexpected_syscall("socket", e),
+            else => |e| syscall.unexpected_err("socket", e),
         }
 
         const optval: c_int = 1;
@@ -154,7 +155,7 @@ pub const Listener = struct {
         );
         switch (linux.errno(sso_rc)) {
             .SUCCESS => {},
-            else => |e| unexpected_syscall("setsockopt", e),
+            else => |e| syscall.unexpected_err("setsockopt", e),
         }
 
         const addr_u, const port_u = Listener.parse_addr(addr) orelse
@@ -170,14 +171,14 @@ pub const Listener = struct {
             .ACCES, .ADDRNOTAVAIL, .FAULT => return BindError.InvalidAddress,
             .ADDRINUSE => return BindError.AddressInUse,
             .NOMEM => return BindError.InsufficientMemory,
-            else => |e| unexpected_syscall("bind", e),
+            else => |e| syscall.unexpected_err("bind", e),
         }
 
         const listen_rc = linux.listen(self.sock_fd, self.backlog);
         switch (linux.errno(listen_rc)) {
             .SUCCESS => {},
             .ADDRINUSE => return BindError.AddressInUse,
-            else => |e| unexpected_syscall("listen", e),
+            else => |e| syscall.unexpected_err("listen", e),
         }
     }
 
@@ -214,7 +215,7 @@ pub const Listener = struct {
                 .OPNOTSUPP,
                 .NETUNREACH,
                 => continue,
-                else => |e| unexpected_syscall("accept", e),
+                else => |e| syscall.unexpected_err("accept", e),
             };
             break conn_sock_fd;
         };
@@ -284,7 +285,7 @@ pub const Listener = struct {
             const close_rc = linux.close(self.sock_fd);
             switch (linux.errno(close_rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| unexpected_syscall("close", e),
+                .BADF => |e| syscall.unexpected_err("close", e),
                 else => |e| log_syscall_err("close", e),
             }
         }
@@ -301,7 +302,7 @@ pub const Listener = struct {
             .SUCCESS => {},
             .FAULT, .INVAL => return AddrError.InvalidAddr,
             .NOBUFS => return AddrError.InsufficientMemory,
-            else => |e| unexpected_syscall("getsockname", e),
+            else => |e| syscall.unexpected_err("getsockname", e),
         }
     }
 };
@@ -740,7 +741,7 @@ fn read_buffered(
                     .SUCCESS => break @intCast(poll_rc),
                     .NOMEM => return error.OutOfMemory,
                     .INTR => continue,
-                    else => |e| unexpected_syscall("poll", e),
+                    else => |e| syscall.unexpected_err("poll", e),
                 }
             };
 
@@ -754,7 +755,7 @@ fn read_buffered(
                 error.Unreachable,
                 error.Unexpected,
                 => |err| return err,
-                error.WouldBlock => unexpected_syscall("read", linux.E.AGAIN),
+                error.WouldBlock => syscall.unexpected_err("read", linux.E.AGAIN),
             };
         }
         self.read_buf.mark_written(n);
@@ -799,7 +800,7 @@ fn drain(self: *Self, conn: *Listener.Connection) void {
             .SUCCESS => @intCast(poll_rc),
             .NOMEM => return,
             .INTR => continue,
-            else => |e| unexpected_syscall("poll", e),
+            else => |e| syscall.unexpected_err("poll", e),
         };
         if (poll_result == 0) return;
 
@@ -847,7 +848,7 @@ fn write_all_poll(
                 .SUCCESS => break @intCast(poll_rc),
                 .NOMEM => return error.OutOfMemory,
                 .INTR => continue,
-                else => |e| unexpected_syscall("poll", e),
+                else => |e| syscall.unexpected_err("poll", e),
             }
         };
         if (poll_result == 0) {
@@ -855,7 +856,7 @@ fn write_all_poll(
         }
 
         const n = conn.write(buf[i..]) catch |e| switch (e) {
-            error.WouldBlock => unexpected_syscall("write", linux.E.AGAIN),
+            error.WouldBlock => syscall.unexpected_err("write", linux.E.AGAIN),
             error.ConnectionReset,
             error.NetworkDown,
             error.Unreachable,
@@ -893,10 +894,6 @@ fn alloc_size(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, s
     else
         req_read_buf & ~mask;
     return .{ .size = read_buf + req_drain_buf, .split = read_buf };
-}
-
-fn unexpected_syscall(syscall_name: []const u8, e: linux.E) noreturn {
-    debug.panic("unexpected error on {s} call: {}\n", .{ syscall_name, e });
 }
 
 fn log_syscall_err(syscall_name: []const u8, e: linux.E) void {
