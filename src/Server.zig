@@ -55,7 +55,7 @@ pub const Listener = struct {
                     .NOTCONN,
                     => |e| syscall.unexpected_err("read", e),
                     else => |e| {
-                        log_syscall_err("read", e);
+                        syscall.log_err("read", e);
                         return RwError.Unexpected;
                     },
                 }
@@ -84,7 +84,7 @@ pub const Listener = struct {
                     .NOTCONN,
                     => |e| syscall.unexpected_err("write", e),
                     else => |e| {
-                        log_syscall_err("write", e);
+                        syscall.log_err("write", e);
                         return RwError.Unexpected;
                     },
                 }
@@ -117,7 +117,7 @@ pub const Listener = struct {
             switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => {},
                 .BADF => |e| syscall.unexpected_err("close", e),
-                else => |e| log_syscall_err("close", e),
+                else => |e| syscall.log_err("close", e),
             }
             self.sock_fd = -1;
             return;
@@ -286,7 +286,7 @@ pub const Listener = struct {
             switch (linux.errno(close_rc)) {
                 .SUCCESS, .INTR => {},
                 .BADF => |e| syscall.unexpected_err("close", e),
-                else => |e| log_syscall_err("close", e),
+                else => |e| syscall.log_err("close", e),
             }
         }
     }
@@ -894,10 +894,6 @@ fn alloc_size(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, s
     else
         req_read_buf & ~mask;
     return .{ .size = read_buf + req_drain_buf, .split = read_buf };
-}
-
-fn log_syscall_err(syscall_name: []const u8, e: linux.E) void {
-    debug.print("unexpected error on {s} call: {}\n", .{ syscall_name, e });
 }
 
 /// Expects a non-negative duration. Fails if duration is too long.
