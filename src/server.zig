@@ -443,6 +443,14 @@ pub fn listen_and_serve(
         return;
     };
 
+    var localaddr: linux.sockaddr.in = undefined;
+    self.local_addr(&localaddr) catch |e| {
+        debug.print("failed to get local address: {s}\n", .{@errorName(e)});
+        return;
+    };
+
+    debug.print("Listening and serving on {s}\n", .{format_addr(localaddr)});
+
     var diag: ConnectionDiagnostics = undefined;
 
     while (true) {
@@ -809,6 +817,20 @@ fn write_all(
 fn local_addr(self: Self, addr: *linux.sockaddr.in) Listener.AddrError!void {
     var len: u32 = @sizeOf(@TypeOf(addr));
     try self.listener.local_addr(@ptrCast(addr), &len);
+}
+
+fn format_addr(localaddr: linux.sockaddr.in) [22:0]u8 {
+    var addr_buf: [22:0]u8 = undefined;
+    const bytes: *const [4]u8 = @ptrCast(&localaddr.addr);
+    const printed = std.fmt.bufPrint(&addr_buf, "{}.{}.{}.{}:{}", .{
+        bytes[0],
+        bytes[1],
+        bytes[2],
+        bytes[3],
+        @byteSwap(localaddr.port),
+    }) catch unreachable;
+    addr_buf[printed.len] = 0;
+    return addr_buf;
 }
 
 fn alloc_size(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, split: usize } {
