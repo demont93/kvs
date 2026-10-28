@@ -6,4 +6,5 @@ pub const Server = @import("Server.zig");
 test {
     _ = @import("protocol.zig");
     _ = @import("Server.zig");
+    _ = @import("syscall.zig");
 }
