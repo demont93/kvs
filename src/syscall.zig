@@ -6,6 +6,7 @@ const testing = std.testing;
 const debug = std.debug;
 const errno = linux.errno;
 const builtin = @import("builtin");
+const Clock = std.Io.Clock;
 
 pub fn unexpected_err(syscall_name: []const u8, e: linux.E) noreturn {
     debug.panic("unexpected error on {s} call: {}\n", .{ syscall_name, e });
@@ -83,6 +84,27 @@ pub fn parse_addr(addr: []const u8) ?linux.sockaddr.in {
         .big => .{ .addr = addr_u, .port = @truncate(port) },
         .little => .{ .addr = @byteSwap(addr_u), .port = @byteSwap(@as(u16, @truncate(port))) },
     };
+}
+
+/// Returns the RC without INTR, which is retried internally.
+pub fn poll(io: Io, fds: []linux.pollfd, deadline: Clock.Timestamp) usize {
+    while (true) {
+        const timeout = timeout_remaining_ms(io, deadline) orelse return 0;
+        const poll_rc = linux.poll(fds.ptr, fds.len, timeout);
+        switch (linux.errno(poll_rc)) {
+            .INTR => continue,
+            else => return poll_rc,
+        }
+    }
+}
+
+pub fn pollfd(fd: i32, events: i16) linux.pollfd {
+    return .{.events = events, .fd = fd, .revents = 0};
+}
+
+fn timeout_remaining_ms(io: Io, deadline: Clock.Timestamp) ?i32 {
+    const timeout = deadline.durationFromNow(io).raw.toMilliseconds();
+    return if (timeout > 0) @intCast(timeout) else null;
 }
 
 test "octet parser" {

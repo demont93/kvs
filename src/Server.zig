@@ -659,11 +659,7 @@ fn read_buffered(
 ) ReadError![]u8 {
     var chunk = self.read_buf.contents(size);
     if (chunk.len == 0) {
-        var pollfd = linux.pollfd{
-            .fd = conn.sock_fd,
-            .events = linux.POLL.IN,
-            .revents = 0,
-        };
+        var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
 
         var n = conn.read(self.read_buf.write()) catch |e| switch (e) {
             error.ConnectionReset,
@@ -675,16 +671,13 @@ fn read_buffered(
         };
 
         if (n == 0) {
-            const poll_result: i32 = while (true) {
-                const timeout = self.timeout_remaining_ms(deadline) orelse return error.ReadTimeout;
-                const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
-                switch (linux.errno(poll_rc)) {
-                    .SUCCESS => break @intCast(poll_rc),
-                    .NOMEM => return error.OutOfMemory,
-                    .INTR => continue,
-                    else => |e| syscall.unexpected_err("poll", e),
-                }
-            };
+            const pollfds: *[1]linux.pollfd = &pollfd;
+            const poll_result: usize = syscall.poll(self.io, pollfds, deadline);
+            switch (linux.errno(poll_result)) {
+                .SUCCESS => {},
+                .NOMEM => return error.OutOfMemory,
+                else => |e| syscall.unexpected_err("poll", e),
+            }
 
             if (poll_result == 0) {
                 return error.ReadTimeout;
@@ -728,19 +721,13 @@ fn write_drain(self: *Self, conn: *Listener.Connection, buf: []const u8) void {
 
 fn drain(self: *Self, conn: *Listener.Connection) void {
     const deadline = self.make_deadline(self.grace_period);
-    var pollfd = linux.pollfd{
-        .events = linux.POLL.IN,
-        .fd = conn.sock_fd,
-        .revents = 0,
-    };
+    var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
     var i: usize = 0;
     while (i < self.drain_buf.len) {
-        const timeout = self.timeout_remaining_ms(deadline) orelse return;
-        const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
+        const poll_rc = syscall.poll(self.io, @as(*[1]linux.pollfd, &pollfd), deadline);
         const poll_result: i32 = switch (linux.errno(poll_rc)) {
             .SUCCESS => @intCast(poll_rc),
             .NOMEM => return,
-            .INTR => continue,
             else => |e| syscall.unexpected_err("poll", e),
         };
         if (poll_result == 0) return;
@@ -761,16 +748,12 @@ fn write_all(
 }
 
 fn write_all_poll(
-    self: *Self,
+    self: Self,
     conn: *Listener.Connection,
     buf: []const u8,
     deadline: Io.Clock.Timestamp,
 ) WriteError!void {
-    var pollfd = linux.pollfd{
-        .fd = conn.sock_fd,
-        .events = linux.POLL.OUT,
-        .revents = 0,
-    };
+    var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.OUT);
 
     var i: usize = conn.write(buf) catch |e| switch (e) {
         error.WouldBlock => 0,
@@ -782,17 +765,13 @@ fn write_all_poll(
     };
 
     while (i < buf.len) {
-        const poll_result: i32 = while (true) {
-            const timeout = self.timeout_remaining_ms(deadline) orelse return error.WriteTimeout;
-            const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
-            switch (linux.errno(poll_rc)) {
-                .SUCCESS => break @intCast(poll_rc),
-                .NOMEM => return error.OutOfMemory,
-                .INTR => continue,
-                else => |e| syscall.unexpected_err("poll", e),
-            }
-        };
-        if (poll_result == 0) {
+        const poll_rc = syscall.poll(self.io, @as(*[1]linux.pollfd, &pollfd), deadline);
+        switch (linux.errno(poll_rc)) {
+            .SUCCESS => {},
+            .NOMEM => return error.OutOfMemory,
+            else => |e| syscall.unexpected_err("poll", e),
+        }
+        if (poll_rc == 0) {
             return error.WriteTimeout;
         }
 
