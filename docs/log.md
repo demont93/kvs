@@ -16,3 +16,7 @@ Other good candidates for optimization are eliminating intermediate buffers, for
 ## 2 Syscalls per read/write
 
 The naive implementation polled before each read or write. Considering that the most likely case is that data will be waiting on the receive/send kernel buffer, polling the first time wastes one syscall. Instead, now the system tries to read or write, and polls if WOULDBLOCK.
+
+## A simple client
+
+In order to measure the next steps and take informed decisions, the next logical step is creating a client so we can check many of the claims. Most tests will require opening several connections with the server to test epoll.
