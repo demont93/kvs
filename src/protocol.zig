@@ -7,9 +7,9 @@ const Allocator = mem.Allocator;
 const math = std.math;
 const debug = std.debug;
 
-const max_key_size = 64 * 1024;
-const max_value_size = 16 * 1024 * 1024;
-const parser_buf_size = 1024;
+pub const max_key_size = 64 * 1024;
+pub const max_value_size = 16 * 1024 * 1024;
+pub const parser_buf_size = 1024;
 
 pub const Op = enum(u8) {
     get = 0,
@@ -177,15 +177,15 @@ pub const Parser = struct {
     }
 };
 
-pub const encode = struct {
-    pub const ResponseCode = enum(u8) {
-        Ok = 0,
-        NotFound = 1,
-        Invalid = 2,
-        Timeout = 3,
-        Internal = 4,
-    };
+pub const ResponseCode = enum(u8) {
+    Ok = 0,
+    NotFound = 1,
+    Invalid = 2,
+    Timeout = 3,
+    Internal = 4,
+};
 
+pub const encode = struct {
     pub const not_found = &[_]u8{ @intFromEnum(ResponseCode.NotFound), 0, 0, 0, 0 };
     pub const invalid = &[_]u8{ @intFromEnum(ResponseCode.Invalid), 0, 0, 0, 0 };
     pub const timeout = &[_]u8{ @intFromEnum(ResponseCode.Timeout), 0, 0, 0, 0 };
