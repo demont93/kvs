@@ -193,10 +193,10 @@ pub const encode = struct {
     pub const internal = &[_]u8{ @intFromEnum(ResponseCode.Internal), 0, 0, 0, 0 };
 
     pub fn value(allocator: Allocator, v: []const u8) error{OutOfMemory}![]u8 {
-        return encode_msg(allocator, .Ok, v);
+        return encode_srv_msg(allocator, .Ok, v);
     }
 
-    pub fn encode_msg(
+    pub fn encode_srv_msg(
         allocator: Allocator,
         code: ResponseCode,
         v: []const u8,
@@ -222,6 +222,23 @@ pub const encode = struct {
         @memcpy(msg[5..], v);
 
         return msg;
+    }
+
+    // Assume correct op encoding and key and value length.
+    pub fn encode_client_msg(
+        op: Op,
+        frame: *[9]u8,
+        key: []const u8,
+        val: []const u8,
+        bufs: *[3][]const u8,
+    ) void {
+        mem.writeInt(u32, frame, key.len, .big);
+        mem.writeInt(u32, frame[4..], value.len, .big);
+        frame[8] = @intFromEnum(op);
+
+        bufs[0] = frame;
+        bufs[1] = key;
+        bufs[2] = val;
     }
 };
 
