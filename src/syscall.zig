@@ -8,12 +8,17 @@ const errno = linux.errno;
 const builtin = @import("builtin");
 const Clock = std.Io.Clock;
 
-pub fn unexpected_err(syscall_name: []const u8, e: linux.E) noreturn {
-    debug.panic("unexpected error on {s} call: {}\n", .{ syscall_name, e });
+pub fn errno_bug(syscall_name: []const u8, e: linux.E) noreturn {
+    debug.panic("bug: unexpected error on {s} call: {t}\n", .{ syscall_name, e });
 }
 
-pub fn log_err(syscall_name: []const u8, e: linux.E) void {
-    debug.print("unexpected error on {s} call: {}\n", .{ syscall_name, e });
+pub fn zerrno_bug(syscall_name: []const u8, e: anyerror) noreturn {
+    debug.panic("bug: unexpected error on {s} call: {t}\n", .{ syscall_name, e });
+}
+
+pub fn record_unexpected_errno(unexpected: *linux.E, e: linux.E) error{Unexpected} {
+    unexpected.* = e;
+    return error.Unexpected;
 }
 
 pub const SockBlock = enum {
@@ -86,25 +91,105 @@ pub fn parse_addr(addr: []const u8) ?linux.sockaddr.in {
     };
 }
 
-/// Returns the RC without INTR, which is retried internally.
-pub fn poll(io: Io, fds: []linux.pollfd, deadline: Clock.Timestamp) usize {
+pub const PollError = error{
+    TooManyPollFds,
+    OutOfMemory,
+    Timeout,
+    Unexpected,
+};
+
+// Returns PollError instead of syscall usize.
+pub fn poll(
+    io: Io,
+    fds: []linux.pollfd,
+    deadline: Clock.Timestamp,
+    unexpected: *linux.E,
+) PollError!usize {
     while (true) {
         const timeout = timeout_remaining_ms(io, deadline) orelse return 0;
         const poll_rc = linux.poll(fds.ptr, fds.len, timeout);
-        switch (linux.errno(poll_rc)) {
+        return switch (linux.errno(poll_rc)) {
+            .SUCCESS => if (poll_rc == 0) error.Timeout else poll_rc,
             .INTR => continue,
-            else => return poll_rc,
-        }
+            .INVAL => error.TooManyPollFds,
+            .FAULT => |e| errno_bug("poll", e),
+            else => |e| record_unexpected_errno(unexpected, e),
+        };
     }
 }
 
 pub fn pollfd(fd: i32, events: i16) linux.pollfd {
-    return .{.events = events, .fd = fd, .revents = 0};
+    return .{ .events = events, .fd = fd, .revents = 0 };
 }
 
 fn timeout_remaining_ms(io: Io, deadline: Clock.Timestamp) ?i32 {
     const timeout = deadline.durationFromNow(io).raw.toMilliseconds();
     return if (timeout > 0) @intCast(timeout) else null;
+}
+
+pub const SendAllError = error{Timeout} || SendError;
+
+/// Send a messages through a connection oriented socket writing and waiting no longer than deadline
+/// when it would block.
+pub fn send_all_poll(
+    fd: i32,
+    buf: []const u8,
+    deadline: Io.Clock.Timestamp,
+    io: Io,
+    unexpected: *linux.E,
+) SendAllError!void {
+    var i: usize = 0;
+
+    i += try send_retry(fd, buf, unexpected);
+    if (i == buf.len) {
+        return;
+    }
+
+    var pfd = pollfd(fd, linux.POLL.OUT);
+
+    while (i < buf.len) {
+        _ = poll(io, @as(*[1]linux.pollfd, &pfd), deadline, unexpected) catch |e| switch (e) {
+            error.OutOfMemory, error.Timeout, error.Unexpected => |e| return e,
+            else => |e| zerrno_bug("poll", e),
+        };
+
+        i += try send_retry(fd, buf[i..], unexpected);
+    }
+}
+
+pub const SendError = error{
+    Badf,
+    ConnectionReset,
+    OutOfMemory,
+    NotConnected,
+    NotSock,
+    Pipe,
+    Unexpected,
+};
+
+/// Send to a socket while performing inner retry on EINTR.
+pub fn send_retry(fd: i32, buf: []const u8, unexpected: *linux.E) !usize {
+    while (true) {
+        const write_rc = linux.write(fd, buf.ptr, buf.len);
+        return switch (errno(write_rc)) {
+            .SUCCESS => write_rc,
+            .INTR => continue,
+            .BADF => SendError.Badf,
+            .CONNRESET => SendError.ConnectionReset,
+            .NOMEM => SendError.OutOfMemory,
+            .NOTCONN => SendError.NotConnected,
+            .NOTSOCK => SendError.NotSock,
+            .PIPE => SendError.Pipe,
+            .ACCES,
+            .ALREADY,
+            .DESTADDRREQ,
+            .ISCONN,
+            .MSGSIZE,
+            .OPNOTSUPP,
+            => |e| errno_bug("write", e),
+            else => |e| record_unexpected_errno(unexpected, e),
+        };
+    }
 }
 
 test "octet parser" {

@@ -27,88 +27,55 @@ pub const Listener = struct {
 
         pub const RwError = error{
             ConnectionReset,
-            NetworkDown,
-            Unreachable,
-            Unexpected,
             WouldBlock,
+            Unexpected,
         };
 
-        pub fn read(self: *Connection, buf: []u8) RwError!usize {
+        pub fn read(self: *Connection, buf: []u8, unexpected: *linux.E) RwError!usize {
             return while (true) {
                 const read_rc = linux.read(self.sock_fd, buf.ptr, buf.len);
                 switch (linux.errno(read_rc)) {
                     .SUCCESS => break read_rc,
                     .INTR => continue,
                     .CONNRESET, .PIPE => return RwError.ConnectionReset,
-                    .NETDOWN => return RwError.NetworkDown,
                     .AGAIN => return RwError.WouldBlock,
-                    .TIMEDOUT,
-                    .HOSTUNREACH,
-                    .NETUNREACH,
-                    .HOSTDOWN,
-                    .NONET,
-                    => return RwError.Unreachable,
                     .BADF,
                     .FAULT,
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| syscall.unexpected_err("read", e),
-                    else => |e| {
-                        syscall.log_err("read", e);
-                        return RwError.Unexpected;
-                    },
+                    => |e| syscall.errno_bug("read", e),
+                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
                 }
             };
         }
 
-        pub fn write(self: *Connection, buf: []const u8) RwError!usize {
+        pub fn write(self: *Connection, buf: []const u8, unexpected: *linux.E) RwError!usize {
             return while (true) {
                 const write_rc = linux.write(self.sock_fd, buf.ptr, buf.len);
                 switch (linux.errno(write_rc)) {
                     .SUCCESS => break write_rc,
                     .INTR => continue,
                     .CONNRESET, .PIPE => return RwError.ConnectionReset,
-                    .NETDOWN => return RwError.NetworkDown,
                     .AGAIN => return RwError.WouldBlock,
-                    .TIMEDOUT,
-                    .HOSTUNREACH,
-                    .NETUNREACH,
-                    .HOSTDOWN,
-                    .NONET,
-                    => return RwError.Unreachable,
                     .BADF,
                     .FAULT,
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| syscall.unexpected_err("write", e),
-                    else => |e| {
-                        syscall.log_err("write", e);
-                        return RwError.Unexpected;
-                    },
+                    => |e| syscall.errno_bug("write", e),
+                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
                 }
             };
         }
 
         const ReadExactError = error{UnexpectedEof} || RwError;
 
-        pub fn read_exact(self: *Connection, buf: []u8) ReadExactError!void {
-            var i: usize = 0;
-            while (i < buf.len) {
-                const n = try self.read(buf[i..buf.len]);
-                if (n == 0) {
-                    return ReadExactError.UnexpectedEof;
-                }
-                i += n;
-            }
-        }
-
         pub fn shutdown(self: *Connection) void {
             const shut_rc = linux.shutdown(self.sock_fd, linux.SHUT.WR);
             switch (linux.errno(shut_rc)) {
                 .SUCCESS, .NOTCONN => {},
-                else => |e| syscall.unexpected_err("shutdown", e),
+                else => |e| syscall.errno_bug("shutdown", e),
             }
         }
 
@@ -116,8 +83,8 @@ pub const Listener = struct {
             const rc = linux.close(self.sock_fd);
             switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| syscall.unexpected_err("close", e),
-                else => |e| syscall.log_err("close", e),
+                .BADF => |e| syscall.errno_bug("close", e),
+                else => |e| log_err("closing connection", e),
             }
             self.sock_fd = -1;
             return;
@@ -142,7 +109,7 @@ pub const Listener = struct {
             .ACCES => return BindError.PermissionDenied,
             .MFILE, .NFILE => return BindError.TooManyOpenFiles,
             .NOBUFS, .NOMEM => return BindError.InsufficientMemory,
-            else => |e| syscall.unexpected_err("socket", e),
+            else => |e| syscall.errno_bug("socket", e),
         }
 
         const optval: c_int = 1;
@@ -155,7 +122,7 @@ pub const Listener = struct {
         );
         switch (linux.errno(sso_rc)) {
             .SUCCESS => {},
-            else => |e| syscall.unexpected_err("setsockopt", e),
+            else => |e| syscall.errno_bug("setsockopt", e),
         }
 
         const sock_addr = syscall.parse_addr(addr) orelse return BindError.InvalidAddress;
@@ -169,14 +136,14 @@ pub const Listener = struct {
             .ACCES, .ADDRNOTAVAIL, .FAULT => return BindError.InvalidAddress,
             .ADDRINUSE => return BindError.AddressInUse,
             .NOMEM => return BindError.InsufficientMemory,
-            else => |e| syscall.unexpected_err("bind", e),
+            else => |e| syscall.errno_bug("bind", e),
         }
 
         const listen_rc = linux.listen(self.sock_fd, self.backlog);
         switch (linux.errno(listen_rc)) {
             .SUCCESS => {},
             .ADDRINUSE => return BindError.AddressInUse,
-            else => |e| syscall.unexpected_err("listen", e),
+            else => |e| syscall.errno_bug("listen", e),
         }
     }
 
@@ -205,15 +172,23 @@ pub const Listener = struct {
                 .NOBUFS, .NOMEM => return AcceptError.InsufficientMemory,
                 .PERM => return AcceptError.Firewall,
                 .NETDOWN,
-                .PROTO,
                 .NOPROTOOPT,
                 .HOSTDOWN,
                 .NONET,
                 .HOSTUNREACH,
-                .OPNOTSUPP,
                 .NETUNREACH,
                 => continue,
-                else => |e| syscall.unexpected_err("accept", e),
+                .BADF,
+                .FAULT,
+                .INVAL,
+                .OPNOTSUPP,
+                .PROTO,
+                .AGAIN,
+                => |e| syscall.errno_bug("accept", e),
+                else => |e| {
+                    log_err("unexpected accept error", e);
+                    continue;
+                },
             };
             break conn_sock_fd;
         };
@@ -226,8 +201,8 @@ pub const Listener = struct {
             const close_rc = linux.close(self.sock_fd);
             switch (linux.errno(close_rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| syscall.unexpected_err("close", e),
-                else => |e| syscall.log_err("close", e),
+                .BADF => |e| syscall.errno_bug("close", e),
+                else => |e| log_err("closing listener", e),
             }
         }
     }
@@ -243,7 +218,7 @@ pub const Listener = struct {
             .SUCCESS => {},
             .FAULT, .INVAL => return AddrError.InvalidAddr,
             .NOBUFS => return AddrError.InsufficientMemory,
-            else => |e| syscall.unexpected_err("getsockname", e),
+            else => |e| syscall.errno_bug("getsockname", e),
         }
     }
 };
@@ -348,6 +323,7 @@ grace_period: Io.Duration,
 parser: protocol.Parser,
 allocator: Allocator,
 retry_state: RetryState,
+unexpected_errno: linux.E,
 
 map: BufMap,
 
@@ -413,11 +389,17 @@ pub fn listen_and_serve(
 
         const result = self.handle_connection(&conn, &diag);
         conn.close();
-        result catch {
-            debug.print(
-                "connection error {} while {s}\n",
-                .{ diag.details, diag.action.description() },
-            );
+        result catch |e| {
+            switch (e) {
+                error.Unexpected => log(
+                    "connection error: unexpected {t}",
+                    .{self.unexpected_errno},
+                ),
+                else => debug.print(
+                    "connection error {t} while {s}\n",
+                    .{ diag.details, diag.action.description() },
+                ),
+            }
         };
     }
 }
@@ -441,6 +423,15 @@ pub fn close(self: *Self) void {
     self.map.deinit();
 }
 
+const RequestError = error{
+    ConnectionReset,
+    ReadTimeout,
+    WriteTimeout,
+    OutOfMemory,
+    BadRequest,
+    Unexpected,
+};
+
 fn handle_connection(
     self: *Self,
     conn: *Listener.Connection,
@@ -458,14 +449,6 @@ const RequestResult = enum {
     Continue,
 };
 
-const RequestError = error{
-    ConnectionUnusable,
-    BadRequest,
-    ReadTimeout,
-    Unexpected,
-    OutOfMemory,
-};
-
 fn handle_request(
     self: *Self,
     conn: *Listener.Connection,
@@ -479,14 +462,14 @@ fn handle_request(
     }
 
     const read_result = self.read_request(conn, diag, &req) catch |err| {
-        const response = switch (err) {
-            error.ConnectionUnusable => |e| return e,
-            error.OutOfMemory, error.Unexpected => encode.internal,
+        const error_response = switch (err) {
+            error.ConnectionReset, error.Unexpected => |e| return e,
+            error.OutOfMemory => encode.internal,
             error.BadRequest => encode.invalid,
             error.ReadTimeout => encode.timeout,
         };
-        self.write_drain(conn, response);
-        return err;
+        self.write_drain(conn, error_response);
+        return @errorCast(err);
     };
 
     switch (read_result) {
@@ -503,17 +486,8 @@ fn handle_request(
     }
 
     self.write_all(conn, response) catch |err| {
-        const err_out = switch (err) {
-            error.ConnectionReset,
-            error.NetworkDown,
-            error.Unreachable,
-            error.WriteTimeout,
-            => RequestError.ConnectionUnusable,
-            error.Unexpected => RequestError.Unexpected,
-            error.OutOfMemory => |e| e,
-        };
         diag.record(.Write, err);
-        return err_out;
+        return @errorCast(err);
     };
 
     return .Continue;
@@ -557,7 +531,7 @@ fn handler(
 }
 
 const ReadRequestError = error{
-    ConnectionUnusable,
+    ConnectionReset,
     OutOfMemory,
     BadRequest,
     ReadTimeout,
@@ -582,13 +556,9 @@ fn read_request(
         ) catch |e| {
             const err = switch (e) {
                 error.ReadTimeout => return .Done,
-                error.OutOfMemory, error.Unexpected => |e2| e2,
-                error.ConnectionReset,
-                error.NetworkDown,
-                error.Unreachable,
-                => error.ConnectionUnusable,
+                else => |err| return err,
             };
-            diag.record(.FirstRead, e);
+            diag.record(.FirstRead, err);
             return err;
         };
         if (chunk.len == 0) {
@@ -606,15 +576,8 @@ fn read_request(
     while (!done) {
         const needed = self.parser.bytes_required();
         const chunk = self.read_buffered(conn, needed, deadline) catch |e| {
-            const err = switch (e) {
-                error.ReadTimeout, error.OutOfMemory, error.Unexpected => |e2| e2,
-                error.ConnectionReset,
-                error.NetworkDown,
-                error.Unreachable,
-                => error.ConnectionUnusable,
-            };
             diag.record(.SubsequentReads, e);
-            return err;
+            return e;
         };
         if (chunk.len == 0) {
             diag.record(.SubsequentReads, error.UnexpectedEof);
@@ -646,8 +609,6 @@ const ReadError = error{
     ReadTimeout,
     OutOfMemory,
     ConnectionReset,
-    NetworkDown,
-    Unreachable,
     Unexpected,
 };
 
@@ -661,35 +622,28 @@ fn read_buffered(
     if (chunk.len == 0) {
         var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
 
-        var n = conn.read(self.read_buf.write()) catch |e| switch (e) {
-            error.ConnectionReset,
-            error.NetworkDown,
-            error.Unreachable,
-            error.Unexpected,
-            => |err| return err,
+        var n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
             error.WouldBlock => 0,
+            else => |e| return e,
         };
 
         if (n == 0) {
             const pollfds: *[1]linux.pollfd = &pollfd;
-            const poll_result: usize = syscall.poll(self.io, pollfds, deadline);
-            switch (linux.errno(poll_result)) {
-                .SUCCESS => {},
-                .NOMEM => return error.OutOfMemory,
-                else => |e| syscall.unexpected_err("poll", e),
-            }
+            _ = syscall.poll(
+                self.io,
+                pollfds,
+                deadline,
+                &self.unexpected_errno,
+            ) catch |e| return switch (e) {
+                error.Timeout => error.ReadTimeout,
+                error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+                else => |e2| return e2,
+            };
 
-            if (poll_result == 0) {
-                return error.ReadTimeout;
-            }
-
-            n = conn.read(self.read_buf.write()) catch |e| switch (e) {
-                error.ConnectionReset,
-                error.NetworkDown,
-                error.Unreachable,
-                error.Unexpected,
-                => |err| return err,
-                error.WouldBlock => syscall.unexpected_err("read", linux.E.AGAIN),
+            n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
+                error.Unexpected => |err| return err,
+                error.WouldBlock => syscall.errno_bug("read", linux.E.AGAIN),
+                else => |e| return e,
             };
         }
         self.read_buf.mark_written(n);
@@ -707,8 +661,6 @@ const WriteError = error{
     WriteTimeout,
     OutOfMemory,
     ConnectionReset,
-    NetworkDown,
-    Unreachable,
     Unexpected,
 };
 
@@ -724,15 +676,18 @@ fn drain(self: *Self, conn: *Listener.Connection) void {
     var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
     var i: usize = 0;
     while (i < self.drain_buf.len) {
-        const poll_rc = syscall.poll(self.io, @as(*[1]linux.pollfd, &pollfd), deadline);
-        const poll_result: i32 = switch (linux.errno(poll_rc)) {
-            .SUCCESS => @intCast(poll_rc),
-            .NOMEM => return,
-            else => |e| syscall.unexpected_err("poll", e),
+        _ = syscall.poll(
+            self.io,
+            @as(*[1]linux.pollfd, &pollfd),
+            deadline,
+            &self.unexpected_errno,
+        ) catch |e| switch (e) {
+            error.Timeout, error.Unexpected => return,
+            error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+            error.OutOfMemory => log("OutOfMemory when draining request\n", .{}),
         };
-        if (poll_result == 0) return;
 
-        const n = conn.read(self.drain_buf[i..]) catch return;
+        const n = conn.read(self.drain_buf[i..], &self.unexpected_errno) catch return;
         if (n == 0) return;
         i += n;
     }
@@ -748,43 +703,22 @@ fn write_all(
 }
 
 fn write_all_poll(
-    self: Self,
+    self: *Self,
     conn: *Listener.Connection,
     buf: []const u8,
     deadline: Io.Clock.Timestamp,
 ) WriteError!void {
-    var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.OUT);
-
-    var i: usize = conn.write(buf) catch |e| switch (e) {
-        error.WouldBlock => 0,
-        error.ConnectionReset,
-        error.NetworkDown,
-        error.Unreachable,
-        error.Unexpected,
-        => |err| return err,
+    syscall.send_all_poll(
+        conn.sock_fd,
+        buf,
+        deadline,
+        self.io,
+        &self.unexpected_errno,
+    ) catch |e| switch (e) {
+        error.Timeout => return error.WriteTimeout,
+        error.ConnectionReset, error.OutOfMemory, error.Unexpected => |e| return e,
+        else => |e| syscall.zerrno_bug("send | poll", e),
     };
-
-    while (i < buf.len) {
-        const poll_rc = syscall.poll(self.io, @as(*[1]linux.pollfd, &pollfd), deadline);
-        switch (linux.errno(poll_rc)) {
-            .SUCCESS => {},
-            .NOMEM => return error.OutOfMemory,
-            else => |e| syscall.unexpected_err("poll", e),
-        }
-        if (poll_rc == 0) {
-            return error.WriteTimeout;
-        }
-
-        const n = conn.write(buf[i..]) catch |e| switch (e) {
-            error.WouldBlock => syscall.unexpected_err("write", linux.E.AGAIN),
-            error.ConnectionReset,
-            error.NetworkDown,
-            error.Unreachable,
-            error.Unexpected,
-            => |err| return err,
-        };
-        i += n;
-    }
 }
 
 fn local_addr(self: Self, addr: *linux.sockaddr.in) Listener.AddrError!void {
@@ -833,6 +767,14 @@ fn make_deadline(self: Self, duration: Io.Duration) Io.Clock.Timestamp {
 
 fn now(self: Self) Io.Clock.Timestamp {
     return Io.Clock.Timestamp.now(self.io, Clock);
+}
+
+fn log(comptime fmt: []const u8, args: anytype) void {
+    debug.print(fmt, args);
+}
+
+fn log_err(msg: []const u8, e: anytype) void {
+    debug.print("{s}: {t}\n", .{ msg, e });
 }
 
 test {
@@ -897,7 +839,7 @@ test "slow reading client gets write timeout" {
     var r = t.client_reader();
     try r.interface.readSliceAll(&response);
     try testing.io.sleep(.fromMilliseconds(400), .awake);
-    try testing.expectError(error.ConnectionUnusable, t.close());
+    try testing.expectError(error.WriteTimeout, t.close());
     try testing.expectEqual(Action.Write, t.diag.action);
     try testing.expectEqual(error.WriteTimeout, t.diag.details);
 }
