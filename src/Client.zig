@@ -539,9 +539,9 @@ fn first_read(self: *Self, frame: []u8, deadline: Clock.Timestamp) !usize {
     if (Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
         return error.ReadTimeout;
     }
-    var i = syscall.recv(self.sock_fd, frame, &self.unexpected) catch |e| return switch (e) {
+    var i = syscall.recv(self.sock_fd, frame, &self.unexpected) catch |e| switch (e) {
         error.Again => 0,
-        error.OutOfMemory, error.Eof, error.Unexpected, error.ConnectionReset => |e2| e2,
+        error.OutOfMemory, error.Eof, error.Unexpected, error.ConnectionReset => |e2| return e2,
         error.ConnectionRefused, error.Badf => syscall.zerrno_bug("read", e),
     };
 
@@ -558,9 +558,13 @@ fn first_read(self: *Self, frame: []u8, deadline: Clock.Timestamp) !usize {
             error.OutOfMemory, error.Unexpected => |e2| e2,
         };
 
-        i += syscall.recv(self.sock_fd, frame, &self.unexpected) catch |e| return switch (e) {
+        i += syscall.recv(self.sock_fd, frame, &self.unexpected) catch |e| switch (e) {
             error.Again => 0,
-            error.OutOfMemory, error.Eof, error.Unexpected, error.ConnectionReset => |e2| e2,
+            error.OutOfMemory,
+            error.Eof,
+            error.Unexpected,
+            error.ConnectionReset,
+            => |e2| return e2,
             error.ConnectionRefused, error.Badf => syscall.zerrno_bug("read", e),
         };
     }
