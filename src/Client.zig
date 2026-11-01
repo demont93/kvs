@@ -383,10 +383,13 @@ fn writev_all(self: *Self, data: *[3][]const u8, deadline: Clock.Timestamp) !voi
 
     var iovecs: [3]posix.iovec_const = undefined;
     var full_len: usize = 0;
-    for (data, &iovecs) |*s, *v| {
-        v.base = s.ptr;
-        v.len = s.len;
+    var iovecs_len: usize = 0;
+    for (data) |*s| {
+        if (s.len == 0) continue;
+        iovecs[iovecs_len].base = s.ptr;
+        iovecs[iovecs_len].len = s.len;
         full_len += s.len;
+        iovecs_len += 1;
     }
     var offset: i64 = 0;
 
@@ -394,7 +397,7 @@ fn writev_all(self: *Self, data: *[3][]const u8, deadline: Clock.Timestamp) !voi
         if (self.now().compare(.gte, deadline)) {
             return error.WriteTimeout;
         }
-        var writev_rc = linux.writev(self.sock_fd, &iovecs, iovecs.len);
+        var writev_rc = linux.writev(self.sock_fd, &iovecs, iovecs_len);
         switch (errno(writev_rc)) {
             .SUCCESS => offset += @intCast(writev_rc),
             .AGAIN => {},
@@ -412,6 +415,7 @@ fn writev_all(self: *Self, data: *[3][]const u8, deadline: Clock.Timestamp) !voi
             .ISCONN,
             .MSGSIZE,
             .OPNOTSUPP,
+            .FAULT,
             => |e| syscall.errno_bug("writev", e),
             else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
         }
