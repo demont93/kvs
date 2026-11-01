@@ -796,3 +796,39 @@ fn send_request_receive_response_server(srv: *TestServer, arena: Allocator) !voi
     try w.interface.flush();
     s.close(testing.io);
 }
+
+test "multiple requests" {
+    var t = try Tester.init_connection(multiple_requests);
+    defer t.deinit();
+    const addr = try t.str_addr();
+    try t.client.init(testing.io, addr);
+    var resp1 = try t.client.del("something else gigantic");
+    try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
+    var resp2 = try t.client.get(t.arena.allocator(), "0");
+    try testing.expectEqual(protocol.ResponseCode.NotFound, resp2.code);
+    try t.join();
+}
+
+fn multiple_requests(srv: *TestServer, arena: Allocator) !void {
+    var s, var r, var w = try srv.accept();
+    var req1: [9 + 23]u8 = undefined;
+    try r.interface.readSliceAll(&req1);
+    const exp1 = try protocol.encode.encode_client_msg_alloc(
+        .del,
+        "something else gigantic",
+        &.{},
+        arena,
+    );
+    try testing.expectEqualSlices(u8, exp1, &req1);
+    const resp1 = try protocol.encode.encode_srv_msg(arena, .Ok, &.{});
+    try w.interface.writeAll(resp1);
+    try w.interface.flush();
+    var req2: [9 + 1]u8 = undefined;
+    try r.interface.readSliceAll(&req2);
+    const exp2 = try protocol.encode.encode_client_msg_alloc(.get, "0", &.{}, arena);
+    try testing.expectEqualSlices(u8, exp2, &req2);
+    const resp2 = try protocol.encode.encode_srv_msg(arena, .NotFound, &.{});
+    try w.interface.writeAll(resp2);
+    try w.interface.flush();
+    s.close(testing.io);
+}
