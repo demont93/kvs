@@ -634,47 +634,57 @@ const TestServer = struct {
     }
 };
 
+const TestShared = struct {
+    result: anyerror!void,
+    event: Io.Event,
+    arena_alloc: std.heap.ArenaAllocator,
+
+    fn arena(self: *TestShared) Allocator {
+        return self.arena_alloc.allocator();
+    }
+};
+
 const Tester = struct {
     server: TestServer,
     client: Self,
     thread_handle: Thread,
     addr: Ip4Address,
     addr_buf: [21]u8,
-    result: *anyerror!void,
-    arena: std.heap.ArenaAllocator = std.heap.ArenaAllocator.init(testing.allocator),
+    t: *TestShared,
 
     fn init_connection(f: anytype) !Tester {
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        errdefer arena.deinit();
+        var new_arena = std.heap.ArenaAllocator.init(testing.allocator);
+        errdefer new_arena.deinit();
         const ip = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
         const srv = try ip.listen(testing.io, .{});
         const tsrv = TestServer{
             .server = srv,
-            .w_buf = try arena.allocator().alloc(u8, 256),
-            .r_buf = try arena.allocator().alloc(u8, 256),
+            .w_buf = try new_arena.allocator().alloc(u8, 256),
+            .r_buf = try new_arena.allocator().alloc(u8, 256),
         };
         const addr = srv.socket.address.ip4;
-        const result = try arena.allocator().create(anyerror!void);
-        const thread_handle = try Thread.spawn(.{}, server_func, .{ tsrv, result, f });
+        var t = try new_arena.allocator().create(TestShared);
+        t.event.reset();
+        t.arena_alloc = new_arena;
+        const thread_handle = try Thread.spawn(.{}, server_func, .{ tsrv, t, f });
 
         return .{
-            .arena = arena,
+            .t = t,
             .server = tsrv,
             .thread_handle = thread_handle,
             .client = undefined,
             .addr = addr,
-            .result = result,
             .addr_buf = undefined,
         };
     }
 
     fn deinit(self: *Tester) void {
-        self.arena.deinit();
+        self.t.arena_alloc.deinit();
     }
 
     fn join(self: *Tester) anyerror!void {
         self.thread_handle.join();
-        return self.result.*;
+        return self.t.result;
     }
 
     fn str_addr(self: *Tester) ![]u8 {
@@ -683,11 +693,13 @@ const Tester = struct {
         return self.addr_buf[0..w.end];
     }
 
-    fn server_func(srv: TestServer, result: *anyerror!void, f: anytype) void {
-        var arena = std.heap.ArenaAllocator.init(testing.allocator);
-        defer arena.deinit();
+    fn arena(self: *Tester) Allocator {
+        return self.t.arena_alloc.allocator();
+    }
+
+    fn server_func(srv: TestServer, t: *TestShared, f: anytype) void {
         var copy = srv;
-        result.* = @call(.auto, f, .{ &copy, arena.allocator() });
+        t.result = @call(.auto, f, .{ &copy, t });
     }
 };
 
@@ -779,7 +791,7 @@ test "send request receive response" {
     try t.join();
 }
 
-fn send_request_receive_response_server(srv: *TestServer, arena: Allocator) !void {
+fn send_request_receive_response_server(srv: *TestServer, t: *TestShared) !void {
     var s, var r, var w = try srv.accept();
     var req: [9 + 8]u8 = undefined;
     try r.interface.readSliceAll(&req);
@@ -787,29 +799,29 @@ fn send_request_receive_response_server(srv: *TestServer, arena: Allocator) !voi
         .set,
         "hola",
         "chao",
-        arena,
+        t.arena(),
     );
     try testing.expectEqualSlices(u8, expected_req, &req);
 
-    const response = try protocol.encode.encode_srv_msg(arena, .Ok, &.{});
+    const response = try protocol.encode.encode_srv_msg(t.arena(), .Ok, &.{});
     try w.interface.writeAll(response);
     try w.interface.flush();
     s.close(testing.io);
 }
 
 test "multiple requests" {
-    var t = try Tester.init_connection(multiple_requests);
+    var t = try Tester.init_connection(multiple_requests_server);
     defer t.deinit();
     const addr = try t.str_addr();
     try t.client.init(testing.io, addr);
     var resp1 = try t.client.del("something else gigantic");
     try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
-    var resp2 = try t.client.get(t.arena.allocator(), "0");
+    var resp2 = try t.client.get(t.arena(), "0");
     try testing.expectEqual(protocol.ResponseCode.NotFound, resp2.code);
     try t.join();
 }
 
-fn multiple_requests(srv: *TestServer, arena: Allocator) !void {
+fn multiple_requests_server(srv: *TestServer, t: *TestShared) !void {
     var s, var r, var w = try srv.accept();
     var req1: [9 + 23]u8 = undefined;
     try r.interface.readSliceAll(&req1);
@@ -817,18 +829,91 @@ fn multiple_requests(srv: *TestServer, arena: Allocator) !void {
         .del,
         "something else gigantic",
         &.{},
-        arena,
+        t.arena(),
     );
     try testing.expectEqualSlices(u8, exp1, &req1);
-    const resp1 = try protocol.encode.encode_srv_msg(arena, .Ok, &.{});
+    const resp1 = try protocol.encode.encode_srv_msg(t.arena(), .Ok, &.{});
     try w.interface.writeAll(resp1);
     try w.interface.flush();
     var req2: [9 + 1]u8 = undefined;
     try r.interface.readSliceAll(&req2);
-    const exp2 = try protocol.encode.encode_client_msg_alloc(.get, "0", &.{}, arena);
+    const exp2 = try protocol.encode.encode_client_msg_alloc(.get, "0", &.{}, t.arena());
     try testing.expectEqualSlices(u8, exp2, &req2);
-    const resp2 = try protocol.encode.encode_srv_msg(arena, .NotFound, &.{});
+    const resp2 = try protocol.encode.encode_srv_msg(t.arena(), .NotFound, &.{});
     try w.interface.writeAll(resp2);
     try w.interface.flush();
     s.close(testing.io);
+}
+
+test "client reconnects on stale connection" {
+    var t = try Tester.init_connection(client_reconnects_on_stale_connection_server);
+    defer t.deinit();
+    const addr = try t.str_addr();
+    try t.client.init(testing.io, addr);
+
+    var resp1 = try t.client.set("something", &.{});
+    try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
+
+    try t.t.event.waitTimeout(
+        testing.io,
+        .{ .duration = .{ .clock = .awake, .raw = .fromSeconds(1) } },
+    );
+
+    var resp2 = try t.client.get(t.arena(), "0");
+    try testing.expectEqual(protocol.ResponseCode.NotFound, resp2.code);
+
+    try t.join();
+}
+
+fn client_reconnects_on_stale_connection_server(srv: *TestServer, t: *TestShared) !void {
+    var s, var r, var w = try srv.accept();
+    try expect_request(
+        t.arena(),
+        &r.interface,
+        &w.interface,
+        .set,
+        "something",
+        &.{},
+        .Ok,
+        "",
+    );
+
+    s.close(testing.io);
+    t.event.set(testing.io);
+
+    s, r, w = try srv.accept();
+    try expect_request(
+        t.arena(),
+        &r.interface,
+        &w.interface,
+        .get,
+        "0",
+        &.{},
+        .NotFound,
+        "",
+    );
+}
+
+fn expect_request(
+    arena: Allocator,
+    r: *Reader,
+    w: *Writer,
+    expected_code: protocol.Op,
+    expected_key: []const u8,
+    expected_value: []const u8,
+    response_code: protocol.ResponseCode,
+    response_value: []const u8,
+) !void {
+    const exp = try protocol.encode.encode_client_msg_alloc(
+        expected_code,
+        expected_key,
+        expected_value,
+        arena,
+    );
+    const req: []u8 = try arena.alloc(u8, exp.len);
+    try r.readSliceAll(req);
+    try testing.expectEqualSlices(u8, exp, req);
+    const resp = try protocol.encode.encode_srv_msg(arena, response_code, response_value);
+    try w.writeAll(resp);
+    try w.flush();
 }
