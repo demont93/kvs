@@ -202,6 +202,12 @@ fn do_request(
     op: protocol.Op,
     data: *[3][]const u8,
 ) !Response {
+    errdefer {
+        if (self.sock_fd >= 0) {
+            self.close_fd();
+        }
+    }
+
     const write_deadline = self.create_deadline(self.write_timeout);
 
     var request_state: RequestState = .init(self.sock_fd, op);
@@ -229,71 +235,72 @@ fn do_request(
         }
     }
 
-    const result = while (request_state.next()) |action| {
-        const connect_result = switch (action) {
-            .cont => {},
-            .connect => self.connect(write_deadline),
-            .reconnect => self.reconnect(write_deadline),
-            .wait_connect => blk: {
-                self.io.sleep(retry_connect_delay, .awake) catch unreachable;
-                break :blk self.connect(write_deadline);
-            },
-        };
+    const result =
+        while (request_state.next()) |action| {
+            const connect_result = switch (action) {
+                .cont => {},
+                .connect => self.connect(write_deadline),
+                .reconnect => self.reconnect(write_deadline),
+                .wait_connect => blk: {
+                    self.io.sleep(retry_connect_delay, .awake) catch unreachable;
+                    break :blk self.connect(write_deadline);
+                },
+            };
 
-        connect_result catch |err| {
-            switch (err) {
-                error.AlreadyConnected => unreachable,
+            connect_result catch |err| {
+                switch (err) {
+                    error.AlreadyConnected => unreachable,
 
-                error.PermissionDenied,
-                error.TooManyOpenFiles,
-                error.OutOfMemory,
-                error.ConnectionRefused,
-                error.NoAddressAvailable,
-                error.Unreachable,
-                error.NetworkTimeout,
-                error.Unexpected,
-                => |e| request_state.set(.{ .conn_failed = e }),
+                    error.PermissionDenied,
+                    error.TooManyOpenFiles,
+                    error.OutOfMemory,
+                    error.ConnectionRefused,
+                    error.NoAddressAvailable,
+                    error.Unreachable,
+                    error.NetworkTimeout,
+                    error.Unexpected,
+                    => |e| request_state.set(.{ .conn_failed = e }),
 
-                error.Timeout => request_state.set(.{ .fatal = error.ConnectTimeout }),
+                    error.Timeout => request_state.set(.{ .fatal = error.ConnectTimeout }),
 
-                error.InvalidAddress => |e| request_state.set(.{ .fatal = e }),
-            }
-            continue;
-        };
+                    error.InvalidAddress => |e| request_state.set(.{ .fatal = e }),
+                }
+                continue;
+            };
 
-        self.writev_all(data, write_deadline) catch |err| {
-            switch (err) {
-                error.WriteTimeout => |e| request_state.set(.{ .fatal = e }),
+            self.writev_all(data, write_deadline) catch |err| {
+                switch (err) {
+                    error.WriteTimeout => |e| request_state.set(.{ .fatal = e }),
 
-                error.Pipe => request_state.set(.closed),
+                    error.Pipe => request_state.set(.closed),
 
-                error.OutOfMemory,
-                error.Unexpected,
-                error.ConnectionReset,
-                => |e| request_state.set(.{ .unusable = e }),
+                    error.OutOfMemory,
+                    error.Unexpected,
+                    error.ConnectionReset,
+                    => |e| request_state.set(.{ .unusable = e }),
 
-                error.Badf,
-                error.NotConnected,
-                error.NotSock,
-                => syscall.zerrno_bug("write", err),
-            }
-            continue;
-        };
+                    error.Badf,
+                    error.NotConnected,
+                    error.NotSock,
+                    => syscall.zerrno_bug("write", err),
+                }
+                continue;
+            };
 
-        break self.do_request_read_response(allocator, op) catch |err| {
-            switch (err) {
-                error.ConnectionWasClosed => request_state.set(.closed),
-                error.ReadTimeout => |e| request_state.set(.{ .fatal = e }),
-                error.OutOfMemory,
-                error.Unexpected,
-                error.ConnectionReset,
-                error.UnexpectedEof,
-                error.BadResponse,
-                => |e| request_state.set(.{ .unusable_after_write = e }),
-            }
-            continue;
-        };
-    } else request_state.err();
+            break self.do_request_read_response(allocator, op) catch |err| {
+                switch (err) {
+                    error.ConnectionWasClosed => request_state.set(.closed),
+                    error.ReadTimeout => |e| request_state.set(.{ .fatal = e }),
+                    error.OutOfMemory,
+                    error.Unexpected,
+                    error.ConnectionReset,
+                    error.UnexpectedEof,
+                    error.BadResponse,
+                    => |e| request_state.set(.{ .unusable_after_write = e }),
+                }
+                continue;
+            };
+        } else request_state.err();
 
     _ = result catch |err| {
         if (err == error.Unexpected) {
@@ -1013,5 +1020,34 @@ fn retries_get_server(srv: *TestServer, t: *TestShared) !void {
 
     s = try srv.accept2();
     try s.expect_req(t.arena(), .get, "my key", "", .Ok, "");
+    s.close();
+}
+
+test "failed request cleans up the socket fd" {
+    var t: Tester = try .init_connection(failed_request_cleans_up_fd);
+    defer t.deinit();
+
+    try t.client.init(testing.io, try t.str_addr());
+    defer t.client.deinit();
+
+    try testing.expectError(error.UnexpectedEof, t.client.del("."));
+
+    try testing.expectEqual(-1, t.client.sock_fd);
+
+    _ = try t.client.set("set", "hola");
+
+    try t.join();
+}
+
+fn failed_request_cleans_up_fd(srv: *TestServer, t: *TestShared) !void {
+    var s = try srv.accept2();
+    _ = try s.r.interface.readAlloc(t.arena(), 10);
+    try s.w.interface.writeByte('0');
+    try s.w.interface.flush();
+
+    s.close();
+
+    s = try srv.accept2();
+    try s.expect_req(t.arena(), .set, "set", "hola", .Ok, "");
     s.close();
 }
