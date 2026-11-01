@@ -624,12 +624,52 @@ const TestServer = struct {
     w_buf: []u8,
     r_buf: []u8,
 
+    const TestStream = struct {
+        stream: Stream,
+        r: Stream.Reader,
+        w: Stream.Writer,
+
+        fn expect_req(
+            self: *TestStream,
+            arena: Allocator,
+            expected_code: protocol.Op,
+            expected_key: []const u8,
+            expected_value: []const u8,
+            response_code: protocol.ResponseCode,
+            response_value: []const u8,
+        ) !void {
+            return expect_request(
+                arena,
+                &self.r.interface,
+                &self.w.interface,
+                expected_code,
+                expected_key,
+                expected_value,
+                response_code,
+                response_value,
+            );
+        }
+
+        fn close(self: *TestStream) void {
+            self.stream.close(testing.io);
+        }
+    };
+
     fn accept(self: *TestServer) !struct { Stream, Stream.Reader, Stream.Writer } {
         const stream = try self.server.accept(testing.io);
         return .{
             stream,
             stream.reader(testing.io, self.r_buf),
             stream.writer(testing.io, self.w_buf),
+        };
+    }
+
+    fn accept2(self: *TestServer) !TestStream {
+        const stream = try self.server.accept(testing.io);
+        return .{
+            .stream = stream,
+            .r = stream.reader(testing.io, self.r_buf),
+            .w = stream.writer(testing.io, self.w_buf),
         };
     }
 };
@@ -779,6 +819,30 @@ fn server(
     stream.close(testing.io);
 }
 
+fn expect_request(
+    arena: Allocator,
+    r: *Reader,
+    w: *Writer,
+    expected_code: protocol.Op,
+    expected_key: []const u8,
+    expected_value: []const u8,
+    response_code: protocol.ResponseCode,
+    response_value: []const u8,
+) !void {
+    const exp = try protocol.encode.encode_client_msg_alloc(
+        expected_code,
+        expected_key,
+        expected_value,
+        arena,
+    );
+    const req: []u8 = try arena.alloc(u8, exp.len);
+    try r.readSliceAll(req);
+    try testing.expectEqualSlices(u8, exp, req);
+    const resp = try protocol.encode.encode_srv_msg(arena, response_code, response_value);
+    try w.writeAll(resp);
+    try w.flush();
+}
+
 test "send request receive response" {
     var t = try Tester.init_connection(send_request_receive_response_server);
     defer t.deinit();
@@ -866,54 +930,12 @@ test "client reconnects on stale connection" {
 }
 
 fn client_reconnects_on_stale_connection_server(srv: *TestServer, t: *TestShared) !void {
-    var s, var r, var w = try srv.accept();
-    try expect_request(
-        t.arena(),
-        &r.interface,
-        &w.interface,
-        .set,
-        "something",
-        &.{},
-        .Ok,
-        "",
-    );
+    var s = try srv.accept2();
+    try s.expect_req(t.arena(), .set, "something", &.{}, .Ok, "");
 
-    s.close(testing.io);
+    s.close();
     t.event.set(testing.io);
 
-    s, r, w = try srv.accept();
-    try expect_request(
-        t.arena(),
-        &r.interface,
-        &w.interface,
-        .get,
-        "0",
-        &.{},
-        .NotFound,
-        "",
-    );
-}
-
-fn expect_request(
-    arena: Allocator,
-    r: *Reader,
-    w: *Writer,
-    expected_code: protocol.Op,
-    expected_key: []const u8,
-    expected_value: []const u8,
-    response_code: protocol.ResponseCode,
-    response_value: []const u8,
-) !void {
-    const exp = try protocol.encode.encode_client_msg_alloc(
-        expected_code,
-        expected_key,
-        expected_value,
-        arena,
-    );
-    const req: []u8 = try arena.alloc(u8, exp.len);
-    try r.readSliceAll(req);
-    try testing.expectEqualSlices(u8, exp, req);
-    const resp = try protocol.encode.encode_srv_msg(arena, response_code, response_value);
-    try w.writeAll(resp);
-    try w.flush();
+    s = try srv.accept2();
+    try s.expect_req(t.arena(), .get, "0", &.{}, .NotFound, "");
 }
