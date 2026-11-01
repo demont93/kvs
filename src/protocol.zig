@@ -224,6 +224,21 @@ pub const encode = struct {
         return msg;
     }
 
+    pub fn check_key(key: []const u8) !void {
+        if (key.len > max_key_size) {
+            return error.KeyTooLarge;
+        }
+        if (key.len == 0) {
+            return error.EmptyKey;
+        }
+    }
+
+    pub fn check_value(val: []const u8) !void {
+        if (val.len > max_value_size) {
+            return error.ValueTooLarge;
+        }
+    }
+
     // Assume correct op encoding and key and value length.
     pub fn encode_client_msg(
         op: Op,
@@ -254,7 +269,7 @@ pub const encode = struct {
         mem.writeInt(u32, buf[0..4], @intCast(key.len), .big);
         mem.writeInt(u32, buf[4..8], @intCast(val.len), .big);
         buf[8] = @intFromEnum(op);
-        @memcpy(buf[9..9+key.len], key);
+        @memcpy(buf[9 .. 9 + key.len], key);
         @memcpy(buf[9 + key.len ..], val);
         return buf;
     }

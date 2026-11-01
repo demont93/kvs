@@ -147,9 +147,7 @@ pub const ConnectError = error{
 };
 
 pub fn get(self: *Self, allocator: Allocator, key: []const u8) !Response {
-    if (key.len > protocol.max_key_size) {
-        return error.KeyTooLarge;
-    }
+    try protocol.encode.check_key(key);
     var frame: [9]u8 = undefined;
     var bufs: [3][]const u8 = undefined;
     protocol.encode.encode_client_msg(.get, &frame, key, &.{}, &bufs);
@@ -157,12 +155,8 @@ pub fn get(self: *Self, allocator: Allocator, key: []const u8) !Response {
 }
 
 pub fn set(self: *Self, key: []const u8, value: []const u8) !Response {
-    if (key.len > protocol.max_key_size) {
-        return error.KeyTooLarge;
-    }
-    if (value.len > protocol.max_value_size) {
-        return error.ValueTooLarge;
-    }
+    try protocol.encode.check_key(key);
+    try protocol.encode.check_value(value);
     var frame: [9]u8 = undefined;
     var bufs: [3][]const u8 = undefined;
     protocol.encode.encode_client_msg(.set, &frame, key, value, &bufs);
@@ -170,9 +164,7 @@ pub fn set(self: *Self, key: []const u8, value: []const u8) !Response {
 }
 
 pub fn del(self: *Self, key: []const u8) !Response {
-    if (key.len > protocol.max_key_size) {
-        return error.KeyTooLarge;
-    }
+    try protocol.encode.check_key(key);
     var frame: [9]u8 = undefined;
     var bufs: [3][]const u8 = undefined;
     protocol.encode.encode_client_msg(.del, &frame, key, &.{}, &bufs);
@@ -862,6 +854,7 @@ test "send request receive response" {
     defer t.deinit();
     const addr = try t.str_addr();
     try t.client.init(testing.io, addr);
+    defer t.client.deinit();
     var resp = try t.client.set("hola", "chao");
     defer resp.deinit(testing.allocator);
     try testing.expectEqual(protocol.ResponseCode.Ok, resp.code);
@@ -880,6 +873,7 @@ test "multiple requests" {
     defer t.deinit();
     const addr = try t.str_addr();
     try t.client.init(testing.io, addr);
+    defer t.client.deinit();
     var resp1 = try t.client.del("something else gigantic");
     try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
     var resp2 = try t.client.get(t.arena(), "0");
@@ -899,6 +893,7 @@ test "client reconnects on stale connection" {
     defer t.deinit();
     const addr = try t.str_addr();
     try t.client.init(testing.io, addr);
+    defer t.client.deinit();
 
     var resp1 = try t.client.set("something", &.{});
     try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
@@ -925,7 +920,7 @@ fn client_reconnects_on_stale_connection_server(srv: *TestServer, t: *TestShared
     try s.expect_req(t.arena(), .get, "0", &.{}, .NotFound, "");
 }
 
-test "client reattempts connect" {
+test "reattempts connect" {
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
 
@@ -939,6 +934,7 @@ test "client reattempts connect" {
 
     var c: Self = undefined;
     try c.init(testing.io, str_w.written());
+    defer c.deinit();
 
     var ev: Io.Event = .unset;
     var h = try testing.io.concurrent(
