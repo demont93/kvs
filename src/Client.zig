@@ -12,6 +12,7 @@ const Thread = std.Thread;
 const Stream = net.Stream;
 const Server = net.Server;
 const Ip4Address = net.Ip4Address;
+const IpAddress = net.IpAddress;
 const Writer = Io.Writer;
 const Reader = Io.Reader;
 
@@ -21,6 +22,7 @@ const syscall = @import("syscall.zig");
 const Self = @This();
 
 const max_attempts: i32 = 3;
+const retry_connect_delay: Duration = .fromMilliseconds(100);
 
 io: Io,
 allocator: Allocator,
@@ -110,7 +112,8 @@ const RequestState = struct {
 
     fn err(self: RequestState) RequestError {
         return switch (self.conn_status) {
-            .closed, .ready => unreachable,
+            .ready => unreachable,
+            .closed => RequestError.ClosedByPeer,
             .fatal, .conn_failed, .unusable => |e| e,
         };
     }
@@ -186,15 +189,17 @@ const RequestError = error{
     NetworkTimeout,
     Unexpected,
     ConnectionReset,
+    ClosedByPeer,
     UnexpectedBytes,
     WriteTimeout,
     ReadTimeout,
+    ConnectTimeout,
     InvalidAddress,
     UnexpectedEof,
     BadResponse,
 };
 
-pub fn do_request(
+fn do_request(
     self: *Self,
     allocator: ?Allocator,
     op: protocol.Op,
@@ -227,7 +232,7 @@ pub fn do_request(
             .connect => self.connect(write_deadline),
             .reconnect => self.reconnect(write_deadline),
             .wait_connect => blk: {
-                self.io.sleep(.fromMilliseconds(100), .awake) catch unreachable;
+                self.io.sleep(retry_connect_delay, .awake) catch unreachable;
                 break :blk self.connect(write_deadline);
             },
         };
@@ -246,7 +251,7 @@ pub fn do_request(
                 error.Unexpected,
                 => |e| request_state.set(.{ .conn_failed = e }),
 
-                error.Timeout => request_state.set(.{ .fatal = error.WriteTimeout }),
+                error.Timeout => request_state.set(.{ .fatal = error.ConnectTimeout }),
 
                 error.InvalidAddress => |e| request_state.set(.{ .fatal = e }),
             }
@@ -672,6 +677,10 @@ const TestServer = struct {
             .w = stream.writer(testing.io, self.w_buf),
         };
     }
+
+    fn deinit(self: *TestServer) void {
+        self.server.deinit(testing.io);
+    }
 };
 
 const TestShared = struct {
@@ -695,8 +704,12 @@ const Tester = struct {
     fn init_connection(f: anytype) !Tester {
         var new_arena = std.heap.ArenaAllocator.init(testing.allocator);
         errdefer new_arena.deinit();
+
         const ip = net.IpAddress{ .ip4 = net.Ip4Address.loopback(0) };
-        const srv = try ip.listen(testing.io, .{});
+
+        var srv = try ip.listen(testing.io, .{});
+        errdefer srv.deinit(testing.io);
+
         const tsrv = TestServer{
             .server = srv,
             .w_buf = try new_arena.allocator().alloc(u8, 256),
@@ -739,6 +752,7 @@ const Tester = struct {
 
     fn server_func(srv: TestServer, t: *TestShared, f: anytype) void {
         var copy = srv;
+        defer copy.deinit();
         t.result = @call(.auto, f, .{ &copy, t });
     }
 };
@@ -909,4 +923,62 @@ fn client_reconnects_on_stale_connection_server(srv: *TestServer, t: *TestShared
 
     s = try srv.accept2();
     try s.expect_req(t.arena(), .get, "0", &.{}, .NotFound, "");
+}
+
+test "client reattempts connect" {
+    var arena: std.heap.ArenaAllocator = .init(testing.allocator);
+    defer arena.deinit();
+
+    var str_w = Writer.Allocating.init(arena.allocator());
+    defer str_w.deinit();
+
+    const ip: IpAddress = .{ .ip4 = .loopback(0) };
+
+    var srv_sock = try ip.bind(testing.io, .{ .mode = .stream });
+    try srv_sock.address.format(&str_w.writer);
+
+    var c: Self = undefined;
+    try c.init(testing.io, str_w.written());
+
+    var ev: Io.Event = .unset;
+    var h = try testing.io.concurrent(
+        client_reattempts_connect_server,
+        .{ &srv_sock, &ev },
+    );
+    defer h.await(testing.io) catch {};
+
+    ev.set(testing.io);
+    if (c.del("s")) |_| {
+        try testing.expect(false);
+    } else |err| switch (err) {
+        error.ClosedByPeer, error.ConnectionReset => |e| try testing.expectEqual(e, err),
+        else => |e| try testing.expectEqual(error.ConnectionReset, e),
+    }
+
+    try h.await(testing.io);
+}
+
+fn client_reattempts_connect_server(
+    sock: *net.Socket,
+    ev: *Io.Event,
+) !void {
+    try ev.waitTimeout(
+        testing.io,
+        .{ .duration = .{ .clock = .awake, .raw = .fromMilliseconds(500) } },
+    );
+
+    testing.io.sleep(.fromMilliseconds(retry_connect_delay.toMilliseconds() * 2), .awake) catch
+        unreachable;
+
+    switch (errno(linux.listen(sock.handle, 0))) {
+        .SUCCESS => {},
+        else => |e| {
+            std.debug.print("unexpected listen errno: {t}\n", .{e});
+            return error.Unexpected;
+        },
+    }
+
+    var srv: Server = .{ .socket = sock.* };
+    var s = try srv.accept(testing.io);
+    s.close(testing.io);
 }
