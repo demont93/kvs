@@ -954,12 +954,7 @@ test "reattempts connect" {
     defer h.await(testing.io) catch {};
 
     ev.set(testing.io);
-    if (c.del("s")) |_| {
-        try testing.expect(false);
-    } else |err| switch (err) {
-        error.ClosedByPeer, error.ConnectionReset => |e| try testing.expectEqual(e, err),
-        else => |e| try testing.expectEqual(error.ConnectionReset, e),
-    }
+    try testing.expectError(error.ConnectionReset, c.del("s"));
 
     try h.await(testing.io);
 }
@@ -986,5 +981,8 @@ fn client_reattempts_connect_server(
 
     var srv: Server = .{ .socket = sock.* };
     var s = try srv.accept(testing.io);
+    var r_buf: [1]u8 = undefined;
+    var r = s.reader(testing.io, &r_buf);
+    try r.interface.fill(1);
     s.close(testing.io);
 }
