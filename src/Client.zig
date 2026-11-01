@@ -87,20 +87,20 @@ const RequestState = struct {
         }
 
         if (!(self.conn_age == .old_connection and self.conn_status == .closed)) {
-        self.attempts += 1;
+            self.attempts += 1;
         }
 
         const action: ?Action = switch (self.conn_status) {
             .idle => unreachable,
             .disconnected => .connect,
-                .ready => .cont,
+            .ready => .cont,
             .unusable, .closed => .reconnect,
             .unusable_after_write => switch (self.op) {
                 .get => .reconnect,
                 .set, .del => null,
-                },
-                .fatal => null,
-                .conn_failed => .wait_connect,
+            },
+            .fatal => null,
+            .conn_failed => .wait_connect,
         };
 
         if (action) |a| switch (a) {
@@ -985,4 +985,33 @@ fn client_reattempts_connect_server(
     var r = s.reader(testing.io, &r_buf);
     try r.interface.fill(1);
     s.close(testing.io);
+}
+
+test "retries idempotent after half reading response" {
+    var t: Tester = try .init_connection(retries_get_server);
+    defer t.deinit();
+
+    try t.client.init(testing.io, try t.str_addr());
+    defer t.client.deinit();
+
+    const resp = try t.client.get(t.arena(), "my key");
+    try testing.expectEqual(protocol.ResponseCode.Ok, resp.code);
+    try t.join();
+}
+
+fn retries_get_server(srv: *TestServer, t: *TestShared) !void {
+    var s = try srv.accept2();
+    const exp = try protocol.encode.encode_client_msg_alloc(.get, "my key", "", t.arena());
+    const req = try t.arena().alloc(u8, exp.len);
+    try s.r.interface.readSliceAll(req);
+    try testing.expectEqualSlices(u8, exp, req);
+
+    const resp = try protocol.encode.encode_srv_msg(t.arena(), .Ok, "");
+    try s.w.interface.writeAll(resp[0..3]);
+    try s.w.interface.flush();
+    s.close();
+
+    s = try srv.accept2();
+    try s.expect_req(t.arena(), .get, "my key", "", .Ok, "");
+    s.close();
 }
