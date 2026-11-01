@@ -45,15 +45,23 @@ pub const Response = struct {
 };
 
 const RequestState = struct {
+    op: protocol.Op,
+    conn_age: ConnAge,
+    conn_status: ConnStatus,
+    attempts: i32,
+
     const ConnAge = enum {
         no_connection,
         old_connection,
         new_connection,
     };
     const ConnStatus = union(enum) {
+        disconnected,
+        idle,
         ready,
         closed,
         unusable: RequestError,
+        unusable_after_write: RequestError,
         fatal: RequestError,
         conn_failed: RequestError,
     };
@@ -64,15 +72,12 @@ const RequestState = struct {
         cont,
     };
 
-    conn_age: ConnAge,
-    conn_status: ConnStatus,
-    attempts: i32,
-
-    fn init(fd: i32) RequestState {
+    fn init(fd: i32, op: protocol.Op) RequestState {
         return .{
             .conn_age = if (fd < 0) .no_connection else .old_connection,
             .conn_status = .ready,
             .attempts = 0,
+            .op = op,
         };
     }
 
@@ -81,29 +86,29 @@ const RequestState = struct {
             return null;
         }
 
+        if (!(self.conn_age == .old_connection and self.conn_status == .closed)) {
         self.attempts += 1;
+        }
 
-        return switch (self.conn_age) {
-            .no_connection => blk: {
-                if (self.conn_status != .ready) unreachable;
-                self.conn_age = .new_connection;
-                break :blk .connect;
-            },
-            .old_connection => switch (self.conn_status) {
+        const action: ?Action = switch (self.conn_status) {
+            .idle => unreachable,
+            .disconnected => .connect,
                 .ready => .cont,
-                .unusable, .closed => blk: {
-                    self.conn_age = .new_connection;
-                    break :blk .reconnect;
+            .unusable, .closed => .reconnect,
+            .unusable_after_write => switch (self.op) {
+                .get => .reconnect,
+                .set, .del => null,
                 },
                 .fatal => null,
-                .conn_failed => unreachable,
-            },
-            .new_connection => switch (self.conn_status) {
-                .ready => .cont,
                 .conn_failed => .wait_connect,
-                .unusable, .closed, .fatal => null,
-            },
         };
+
+        if (action) |a| switch (a) {
+            .reconnect, .connect, .wait_connect => self.conn_age = .new_connection,
+            .cont => {},
+        };
+
+        return action;
     }
 
     fn set(self: *RequestState, status: ConnStatus) void {
@@ -112,9 +117,9 @@ const RequestState = struct {
 
     fn err(self: RequestState) RequestError {
         return switch (self.conn_status) {
-            .ready => unreachable,
+            .idle, .ready, .disconnected => unreachable,
             .closed => RequestError.ClosedByPeer,
-            .fatal, .conn_failed, .unusable => |e| e,
+            .unusable_after_write, .fatal, .conn_failed, .unusable => |e| e,
         };
     }
 };
@@ -197,9 +202,17 @@ fn do_request(
     op: protocol.Op,
     data: *[3][]const u8,
 ) !Response {
-    var request_state: RequestState = .init(self.sock_fd);
+    const write_deadline = self.create_deadline(self.write_timeout);
 
-    if (request_state.conn_age == .old_connection) {
+    var request_state: RequestState = .init(self.sock_fd, op);
+
+    if (self.sock_fd >= 0) {
+        request_state.set(.idle);
+    } else {
+        request_state.set(.disconnected);
+    }
+
+    if (request_state.conn_status == .idle) {
         if (self.check_connection()) |state| {
             switch (state) {
                 .up => request_state.set(.ready),
@@ -215,8 +228,6 @@ fn do_request(
             }
         }
     }
-
-    const write_deadline = self.create_deadline(self.write_timeout);
 
     const result = while (request_state.next()) |action| {
         const connect_result = switch (action) {
@@ -272,14 +283,13 @@ fn do_request(
         break self.do_request_read_response(allocator, op) catch |err| {
             switch (err) {
                 error.ConnectionWasClosed => request_state.set(.closed),
-
-                error.ReadTimeout,
+                error.ReadTimeout => |e| request_state.set(.{ .fatal = e }),
                 error.OutOfMemory,
                 error.Unexpected,
                 error.ConnectionReset,
                 error.UnexpectedEof,
                 error.BadResponse,
-                => |e| request_state.set(.{ .fatal = e }),
+                => |e| request_state.set(.{ .unusable_after_write = e }),
             }
             continue;
         };
