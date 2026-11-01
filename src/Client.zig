@@ -856,21 +856,9 @@ test "send request receive response" {
 }
 
 fn send_request_receive_response_server(srv: *TestServer, t: *TestShared) !void {
-    var s, var r, var w = try srv.accept();
-    var req: [9 + 8]u8 = undefined;
-    try r.interface.readSliceAll(&req);
-    const expected_req = try protocol.encode.encode_client_msg_alloc(
-        .set,
-        "hola",
-        "chao",
-        t.arena(),
-    );
-    try testing.expectEqualSlices(u8, expected_req, &req);
-
-    const response = try protocol.encode.encode_srv_msg(t.arena(), .Ok, &.{});
-    try w.interface.writeAll(response);
-    try w.interface.flush();
-    s.close(testing.io);
+    var s = try srv.accept2();
+    try s.expect_req(t.arena(), .set, "hola", "chao", .Ok, &.{});
+    s.close();
 }
 
 test "multiple requests" {
@@ -886,27 +874,10 @@ test "multiple requests" {
 }
 
 fn multiple_requests_server(srv: *TestServer, t: *TestShared) !void {
-    var s, var r, var w = try srv.accept();
-    var req1: [9 + 23]u8 = undefined;
-    try r.interface.readSliceAll(&req1);
-    const exp1 = try protocol.encode.encode_client_msg_alloc(
-        .del,
-        "something else gigantic",
-        &.{},
-        t.arena(),
-    );
-    try testing.expectEqualSlices(u8, exp1, &req1);
-    const resp1 = try protocol.encode.encode_srv_msg(t.arena(), .Ok, &.{});
-    try w.interface.writeAll(resp1);
-    try w.interface.flush();
-    var req2: [9 + 1]u8 = undefined;
-    try r.interface.readSliceAll(&req2);
-    const exp2 = try protocol.encode.encode_client_msg_alloc(.get, "0", &.{}, t.arena());
-    try testing.expectEqualSlices(u8, exp2, &req2);
-    const resp2 = try protocol.encode.encode_srv_msg(t.arena(), .NotFound, &.{});
-    try w.interface.writeAll(resp2);
-    try w.interface.flush();
-    s.close(testing.io);
+    var s = try srv.accept2();
+    try s.expect_req(t.arena(), .del, "something else gigantic", &.{}, .Ok, &.{});
+    try s.expect_req(t.arena(), .get, "0", &.{}, .NotFound, &.{});
+    s.close();
 }
 
 test "client reconnects on stale connection" {
