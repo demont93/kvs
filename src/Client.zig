@@ -22,6 +22,15 @@ const Self = @This();
 
 const max_attempts: i32 = 3;
 
+io: Io,
+allocator: Allocator,
+addr: linux.sockaddr.in,
+sock_fd: i32,
+read_timeout: Duration,
+write_timeout: Duration,
+idle_timeout: Duration,
+unexpected: linux.E,
+
 pub const Response = struct {
     code: protocol.ResponseCode,
     value: []u8,
@@ -107,15 +116,6 @@ const RequestState = struct {
     }
 };
 
-io: Io,
-allocator: Allocator,
-addr: linux.sockaddr.in,
-sock_fd: i32,
-read_timeout: Duration,
-write_timeout: Duration,
-idle_timeout: Duration,
-unexpected: linux.E,
-
 pub fn init(
     self: *Self,
     io: Io,
@@ -142,87 +142,6 @@ pub const ConnectError = error{
     Timeout,
     Unexpected,
 };
-
-fn connect(self: *Self, deadline: Clock.Timestamp) ConnectError!void {
-    if (self.sock_fd > -1) {
-        return ConnectError.AlreadyConnected;
-    }
-
-    const socket_rc = syscall.socket(.NonBlocking);
-    switch (errno(socket_rc)) {
-        .SUCCESS => {},
-        .ACCES => return ConnectError.PermissionDenied,
-        .NFILE, .MFILE => return ConnectError.TooManyOpenFiles,
-        .NOBUFS, .NOMEM => return ConnectError.OutOfMemory,
-        .INVAL, .PROTONOSUPPORT => |e| syscall.errno_bug("socket", e),
-        else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
-    }
-    self.sock_fd = @intCast(socket_rc);
-
-    errdefer self.close_fd();
-    const connect_rc = linux.connect(self.sock_fd, &self.addr, @sizeOf(@TypeOf(self.addr)));
-    switch (errno(connect_rc)) {
-        .SUCCESS => return,
-        .INTR, .INPROGRESS => {},
-        .PERM, .ACCES => return ConnectError.PermissionDenied,
-        .ADDRNOTAVAIL => return ConnectError.NoAddressAvailable,
-        .CONNREFUSED => return ConnectError.ConnectionRefused,
-        .NETUNREACH => return ConnectError.Unreachable,
-        .TIMEDOUT => return ConnectError.NetworkTimeout,
-        .ADDRINUSE,
-        .AFNOSUPPORT,
-        .AGAIN,
-        .ALREADY,
-        .BADF,
-        .FAULT,
-        .ISCONN,
-        .NOTSOCK,
-        .PROTOTYPE,
-        => |e| syscall.errno_bug("connect", e),
-        else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
-    }
-
-    var pollfds = [_]linux.pollfd{syscall.pollfd(self.sock_fd, linux.POLL.OUT)};
-    _ = syscall.poll(self.io, &pollfds, deadline, &self.unexpected) catch |e| return switch (e) {
-        error.TooManyPollFds => syscall.zerrno_bug("poll", e),
-        else => |e2| e2,
-    };
-
-    var raw_sock_err: i32 = 0;
-    var sock_err_len: u32 = @sizeOf(i32);
-    const gso_rc = linux.getsockopt(
-        self.sock_fd,
-        linux.SOL.SOCKET,
-        linux.SO.ERROR,
-        @ptrCast(&raw_sock_err),
-        &sock_err_len,
-    );
-    switch (errno(gso_rc)) {
-        .SUCCESS => {},
-        else => |e| syscall.errno_bug("getsockopt", e),
-    }
-
-    const sock_err: linux.E = @enumFromInt(raw_sock_err);
-    switch (sock_err) {
-        .SUCCESS => {},
-        .PERM, .ACCES => return ConnectError.PermissionDenied,
-        .ADDRNOTAVAIL => return ConnectError.NoAddressAvailable,
-        .CONNREFUSED => return ConnectError.ConnectionRefused,
-        .NETUNREACH => return ConnectError.Unreachable,
-        .TIMEDOUT => return ConnectError.NetworkTimeout,
-        .ADDRINUSE,
-        .AFNOSUPPORT,
-        .AGAIN,
-        .ALREADY,
-        .BADF,
-        .FAULT,
-        .ISCONN,
-        .NOTSOCK,
-        .PROTOTYPE,
-        => |e| syscall.errno_bug("connect", e),
-        else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
-    }
-}
 
 pub fn get(self: *Self, allocator: Allocator, key: []const u8) !Response {
     if (key.len > protocol.max_key_size) {
@@ -376,6 +295,87 @@ pub fn do_request(
     };
 
     return result;
+}
+
+fn connect(self: *Self, deadline: Clock.Timestamp) ConnectError!void {
+    if (self.sock_fd >= 0) {
+        return ConnectError.AlreadyConnected;
+    }
+
+    const socket_rc = syscall.socket(.NonBlocking);
+    switch (errno(socket_rc)) {
+        .SUCCESS => {},
+        .ACCES => return ConnectError.PermissionDenied,
+        .NFILE, .MFILE => return ConnectError.TooManyOpenFiles,
+        .NOBUFS, .NOMEM => return ConnectError.OutOfMemory,
+        .INVAL, .PROTONOSUPPORT => |e| syscall.errno_bug("socket", e),
+        else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
+    }
+    self.sock_fd = @intCast(socket_rc);
+
+    errdefer self.close_fd();
+    const connect_rc = linux.connect(self.sock_fd, &self.addr, @sizeOf(@TypeOf(self.addr)));
+    switch (errno(connect_rc)) {
+        .SUCCESS => return,
+        .INTR, .INPROGRESS => {},
+        .PERM, .ACCES => return ConnectError.PermissionDenied,
+        .ADDRNOTAVAIL => return ConnectError.NoAddressAvailable,
+        .CONNREFUSED => return ConnectError.ConnectionRefused,
+        .NETUNREACH => return ConnectError.Unreachable,
+        .TIMEDOUT => return ConnectError.NetworkTimeout,
+        .ADDRINUSE,
+        .AFNOSUPPORT,
+        .AGAIN,
+        .ALREADY,
+        .BADF,
+        .FAULT,
+        .ISCONN,
+        .NOTSOCK,
+        .PROTOTYPE,
+        => |e| syscall.errno_bug("connect", e),
+        else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
+    }
+
+    var pollfds = [_]linux.pollfd{syscall.pollfd(self.sock_fd, linux.POLL.OUT)};
+    _ = syscall.poll(self.io, &pollfds, deadline, &self.unexpected) catch |e| return switch (e) {
+        error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+        else => |e2| e2,
+    };
+
+    var raw_sock_err: i32 = 0;
+    var sock_err_len: u32 = @sizeOf(i32);
+    const gso_rc = linux.getsockopt(
+        self.sock_fd,
+        linux.SOL.SOCKET,
+        linux.SO.ERROR,
+        @ptrCast(&raw_sock_err),
+        &sock_err_len,
+    );
+    switch (errno(gso_rc)) {
+        .SUCCESS => {},
+        else => |e| syscall.errno_bug("getsockopt", e),
+    }
+
+    const sock_err: linux.E = @enumFromInt(raw_sock_err);
+    switch (sock_err) {
+        .SUCCESS => {},
+        .PERM, .ACCES => return ConnectError.PermissionDenied,
+        .ADDRNOTAVAIL => return ConnectError.NoAddressAvailable,
+        .CONNREFUSED => return ConnectError.ConnectionRefused,
+        .NETUNREACH => return ConnectError.Unreachable,
+        .TIMEDOUT => return ConnectError.NetworkTimeout,
+        .ADDRINUSE,
+        .AFNOSUPPORT,
+        .AGAIN,
+        .ALREADY,
+        .BADF,
+        .FAULT,
+        .ISCONN,
+        .NOTSOCK,
+        .PROTOTYPE,
+        => |e| syscall.errno_bug("connect", e),
+        else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
+    }
 }
 
 fn writev_all(self: *Self, data: *[3][]const u8, deadline: Clock.Timestamp) !void {
