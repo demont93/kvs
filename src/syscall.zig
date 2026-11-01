@@ -16,8 +16,10 @@ pub fn zerrno_bug(syscall_name: []const u8, e: anyerror) noreturn {
     debug.panic("bug: unexpected error on {s} call: {t}\n", .{ syscall_name, e });
 }
 
-pub fn record_unexpected_errno(unexpected: *linux.E, e: linux.E) error{Unexpected} {
-    unexpected.* = e;
+pub fn record_unexpected_errno(unexpected: ?*linux.E, e: linux.E) error{Unexpected} {
+    if (unexpected) |u| {
+        u.* = e;
+    }
     return error.Unexpected;
 }
 
@@ -103,7 +105,7 @@ pub fn poll(
     io: Io,
     fds: []linux.pollfd,
     deadline: Clock.Timestamp,
-    unexpected: *linux.E,
+    unexpected: ?*linux.E,
 ) PollError!usize {
     while (true) {
         const timeout = timeout_remaining_ms(io, deadline) orelse return 0;
@@ -127,6 +129,86 @@ fn timeout_remaining_ms(io: Io, deadline: Clock.Timestamp) ?i32 {
     return if (timeout > 0) @intCast(timeout) else null;
 }
 
+pub const RecvAllError = error{
+    UnexpectedEof,
+    Badf,
+    ConnectionRefused,
+    ConnectionReset,
+    Unexpected,
+    Timeout,
+    OutOfMemory,
+};
+
+pub fn recv_all(
+    fd: i32,
+    buf: []u8,
+    deadline: Clock.Timestamp,
+    io: Io,
+    count: ?*usize,
+    unexpected: ?*linux.E,
+) RecvAllError!void {
+    var i: usize = 0;
+
+    defer {
+        if (count) |c| {
+            c.* = i;
+        }
+    }
+
+    if (Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) {
+        return error.Timeout;
+    }
+    i += recv(fd, buf, unexpected) catch |e| switch (e) {
+        error.Again => 0,
+        error.Eof => return error.UnexpectedEof,
+        else => |e2| return e2,
+    };
+
+    var fds = pollfd(fd, linux.POLL.IN);
+
+    while (i < buf.len) {
+        if (Clock.Timestamp.now(io, .awake).compare(.gte, deadline)) {
+            return error.Timeout;
+        }
+        _ = poll(io, @as(*[1]linux.pollfd, &fds), deadline, unexpected) catch |e| switch (e) {
+            error.TooManyPollFds => unreachable,
+            else => |e| return e,
+        };
+        i += recv(fd, buf[i..], unexpected) catch |e| switch (e) {
+            error.Again => 0,
+            error.Eof => return error.UnexpectedEof,
+            else => |e| return e,
+        };
+    }
+}
+
+pub const RecvError = error{
+    Again,
+    Badf,
+    ConnectionRefused,
+    ConnectionReset,
+    Unexpected,
+    Eof,
+    OutOfMemory,
+};
+
+pub fn recv(fd: i32, buf: []u8, unexpected: ?*linux.E) RecvError!usize {
+    while (true) {
+        const read_rc = linux.read(fd, buf.ptr, buf.len);
+        return switch (errno(read_rc)) {
+            .SUCCESS => if (read_rc == 0) error.Eof else read_rc,
+            .INTR => continue,
+            .AGAIN => error.Again,
+            .BADF => error.Badf,
+            .CONNREFUSED => error.ConnectionRefused,
+            .CONNRESET => error.ConnectionReset,
+            .NOMEM => error.OutOfMemory,
+            .FAULT, .NOTCONN, .NOTSOCK => |e| errno_bug("read", e),
+            else => |e| record_unexpected_errno(unexpected, e),
+        };
+    }
+}
+
 pub const SendAllError = error{Timeout} || SendError;
 
 /// Send a messages through a connection oriented socket writing and waiting no longer than deadline
@@ -136,7 +218,7 @@ pub fn send_all_poll(
     buf: []const u8,
     deadline: Io.Clock.Timestamp,
     io: Io,
-    unexpected: *linux.E,
+    unexpected: ?*linux.E,
 ) SendAllError!void {
     var i: usize = 0;
 
@@ -160,15 +242,15 @@ pub fn send_all_poll(
 pub const SendError = error{
     Badf,
     ConnectionReset,
+    Pipe,
     OutOfMemory,
     NotConnected,
     NotSock,
-    Pipe,
     Unexpected,
 };
 
 /// Send to a socket while performing inner retry on EINTR.
-pub fn send_retry(fd: i32, buf: []const u8, unexpected: *linux.E) !usize {
+pub fn send_retry(fd: i32, buf: []const u8, unexpected: ?*linux.E) !usize {
     while (true) {
         const write_rc = linux.write(fd, buf.ptr, buf.len);
         return switch (errno(write_rc)) {

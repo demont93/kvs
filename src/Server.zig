@@ -794,7 +794,7 @@ test "bind to a connection and read happy" {
 
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(protocol.encode.ResponseCode.NotFound), 0, 0, 0, 0 },
+        &[_]u8{ @intFromEnum(protocol.ResponseCode.NotFound), 0, 0, 0, 0 },
         &response_buf,
     );
 
@@ -816,7 +816,7 @@ test "slow writing client gets read timeout" {
     try r.interface.readSliceAll(&response);
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(protocol.encode.ResponseCode.Timeout), 0, 0, 0, 0 },
+        &[_]u8{ @intFromEnum(protocol.ResponseCode.Timeout), 0, 0, 0, 0 },
         &response,
     );
     try testing.expectError(error.ReadTimeout, t.close());

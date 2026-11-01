@@ -232,13 +232,31 @@ pub const encode = struct {
         val: []const u8,
         bufs: *[3][]const u8,
     ) void {
-        mem.writeInt(u32, frame, key.len, .big);
-        mem.writeInt(u32, frame[4..], value.len, .big);
+        mem.writeInt(u32, frame[0..4], @intCast(key.len), .big);
+        mem.writeInt(u32, frame[4..8], @intCast(val.len), .big);
         frame[8] = @intFromEnum(op);
 
         bufs[0] = frame;
         bufs[1] = key;
         bufs[2] = val;
+    }
+
+    pub fn encode_client_msg_alloc(
+        op: Op,
+        key: []const u8,
+        val: []const u8,
+        allocator: Allocator,
+    ) ![]u8 {
+        const len = 9 + key.len + val.len;
+        const buf = try allocator.alloc(u8, len);
+        errdefer allocator.free(buf);
+
+        mem.writeInt(u32, buf[0..4], @intCast(key.len), .big);
+        mem.writeInt(u32, buf[4..8], @intCast(val.len), .big);
+        buf[8] = @intFromEnum(op);
+        @memcpy(buf[9..9+key.len], key);
+        @memcpy(buf[9 + key.len ..], val);
+        return buf;
     }
 };
 
