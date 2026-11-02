@@ -177,6 +177,7 @@ const RequestError = error{
     InvalidAddress,
     UnexpectedEof,
     BadResponse,
+    Canceled,
 };
 
 fn do_request(
@@ -196,7 +197,10 @@ fn do_request(
         const connect_result = switch (req_state.conn) {
             .ok => if (self.sock_fd == -1) self.connect(deadline),
             .conn_failed => blk: {
-                self.io.sleep(retry_connect_delay, .awake) catch unreachable;
+                self.io.sleep(retry_connect_delay, .awake) catch |e| {
+                    req_state.set(.fatal, e);
+                    continue;
+                };
                 break :blk self.connect(deadline);
             },
             else => self.reconnect(deadline),
