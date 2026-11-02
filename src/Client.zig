@@ -28,8 +28,7 @@ io: Io,
 allocator: Allocator,
 addr: linux.sockaddr.in,
 sock_fd: i32,
-read_timeout: Duration,
-write_timeout: Duration,
+timeout: Duration,
 idle_timeout: Duration,
 unexpected: linux.E,
 
@@ -132,8 +131,7 @@ pub fn init(
     self.io = io;
     self.addr = syscall.parse_addr(addr) orelse return error.InvalidAddress;
     self.sock_fd = -1;
-    self.write_timeout = .fromSeconds(6);
-    self.read_timeout = .fromSeconds(6);
+    self.timeout = .fromSeconds(6);
     self.idle_timeout = .fromSeconds(10);
 }
 
@@ -208,7 +206,7 @@ fn do_request(
         }
     }
 
-    const write_deadline = self.create_deadline(self.write_timeout);
+    const deadline = self.create_deadline(self.timeout);
 
     var request_state: RequestState = .init(self.sock_fd, op);
 
@@ -239,11 +237,11 @@ fn do_request(
         while (request_state.next()) |action| {
             const connect_result = switch (action) {
                 .cont => {},
-                .connect => self.connect(write_deadline),
-                .reconnect => self.reconnect(write_deadline),
+                .connect => self.connect(deadline),
+                .reconnect => self.reconnect(deadline),
                 .wait_connect => blk: {
                     self.io.sleep(retry_connect_delay, .awake) catch unreachable;
-                    break :blk self.connect(write_deadline);
+                    break :blk self.connect(deadline);
                 },
             };
 
@@ -268,7 +266,7 @@ fn do_request(
                 continue;
             };
 
-            self.writev_all(data, write_deadline) catch |err| {
+            self.writev_all(data, deadline) catch |err| {
                 switch (err) {
                     error.WriteTimeout => |e| request_state.set(.{ .fatal = e }),
 
@@ -287,7 +285,7 @@ fn do_request(
                 continue;
             };
 
-            break self.do_request_read_response(allocator, op) catch |err| {
+            break self.do_request_read_response(allocator, op, deadline) catch |err| {
                 switch (err) {
                     error.ConnectionWasClosed => request_state.set(.closed),
                     error.ReadTimeout => |e| request_state.set(.{ .fatal = e }),
@@ -472,12 +470,8 @@ fn do_request_read_response(
     self: *Self,
     allocator: ?Allocator,
     op: protocol.Op,
+    deadline: Clock.Timestamp,
 ) ReadResponseError!Response {
-    const deadline = Clock.Timestamp.fromNow(
-        self.io,
-        .{ .clock = .awake, .raw = self.read_timeout },
-    );
-
     var frame: [5]u8 = undefined;
 
     const n_read = self.first_read(&frame, deadline) catch |e|
