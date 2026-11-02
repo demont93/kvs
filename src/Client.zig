@@ -345,27 +345,27 @@ fn connect(self: *Self, deadline: Clock.Timestamp) ConnectError!void {
 
 fn writev_all(self: *Self, data: *[3][]const u8, deadline: Clock.Timestamp) !void {
     var fds = syscall.pollfd(self.sock_fd, linux.POLL.OUT);
+    var iovec_arr: [3]posix.iovec_const = undefined;
+    const iovecs = blk: {
+        var iovecs_len: usize = 0;
+        for (data) |*s| {
+            if (s.len == 0) continue;
+            iovec_arr[iovecs_len].base = s.ptr;
+            iovec_arr[iovecs_len].len = s.len;
+            iovecs_len += 1;
+        }
+        break :blk iovec_arr[0..iovecs_len];
+    };
 
-    var iovecs: [3]posix.iovec_const = undefined;
-    var full_len: usize = 0;
-    var iovecs_len: usize = 0;
-    for (data) |*s| {
-        if (s.len == 0) continue;
-        iovecs[iovecs_len].base = s.ptr;
-        iovecs[iovecs_len].len = s.len;
-        full_len += s.len;
-        iovecs_len += 1;
+    if (self.now().compare(.gte, deadline)) {
+        return error.WriteTimeout;
     }
-    var offset: i64 = 0;
 
     while (true) {
-        if (self.now().compare(.gte, deadline)) {
-            return error.WriteTimeout;
-        }
-        var writev_rc = linux.writev(self.sock_fd, &iovecs, iovecs_len);
-        switch (errno(writev_rc)) {
-            .SUCCESS => offset += @intCast(writev_rc),
-            .AGAIN => {},
+        const writev_rc = linux.writev(self.sock_fd, iovecs.ptr, iovecs.len);
+        var written: usize = switch (errno(writev_rc)) {
+            .SUCCESS => @intCast(writev_rc),
+            .AGAIN => 0,
             .INTR => continue,
             .BADF => return error.Badf,
             .CONNRESET => return error.ConnectionReset,
@@ -383,18 +383,24 @@ fn writev_all(self: *Self, data: *[3][]const u8, deadline: Clock.Timestamp) !voi
             .FAULT,
             => |e| syscall.errno_bug("writev", e),
             else => |e| return syscall.record_unexpected_errno(&self.unexpected, e),
-        }
-        if (offset >= full_len) {
-            return;
+        };
+
+        if (written > 0) {
+            for (iovecs) |*v| {
+                if (written == 0) break;
+                if (v.len == 0) continue;
+                const min = @min(v.len, written);
+                v.len -= min;
+                v.base += min;
+                written -= min;
+            }
+            if (iovecs[iovecs.len - 1].len == 0) {
+                return;
+            }
         }
 
-        for (&iovecs) |*v| {
-            if (writev_rc == 0) break;
-            if (v.len == 0) continue;
-            const min = @min(v.len, writev_rc);
-            v.len -= min;
-            v.base += min;
-            writev_rc -= min;
+        if (self.now().compare(.gte, deadline)) {
+            return error.WriteTimeout;
         }
         _ = syscall.poll(
             self.io,
