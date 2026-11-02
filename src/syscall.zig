@@ -108,7 +108,7 @@ pub fn poll(
     unexpected: ?*linux.E,
 ) PollError!usize {
     while (true) {
-        const timeout = timeout_remaining_ms(io, deadline) orelse return 0;
+        const timeout = timeout_remaining_ms(io, deadline) orelse return error.Timeout;
         const poll_rc = linux.poll(fds.ptr, fds.len, timeout);
         return switch (linux.errno(poll_rc)) {
             .SUCCESS => if (poll_rc == 0) error.Timeout else poll_rc,
