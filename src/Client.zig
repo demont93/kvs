@@ -116,7 +116,7 @@ pub fn init(
     self.max_attempts = if (opts.max_attempts >= 1)
         opts.max_attempts
     else
-        std.debug.panic("invalid max attempts {} must be >= 1\n", opts.max_attempts);
+        std.debug.panic("invalid client max attempts {} must be >= 1\n", .{opts.max_attempts});
 }
 
 pub const ConnectError = error{
@@ -849,7 +849,7 @@ test "reattempts connect" {
     try srv_sock.address.format(&str_w.writer);
 
     var c: Self = undefined;
-    try c.init(testing.io, str_w.written(), .{});
+    try c.init(testing.io, str_w.written(), .{ .max_attempts = 10 });
     defer c.deinit();
 
     var ev: Io.Event = .unset;
@@ -860,7 +860,8 @@ test "reattempts connect" {
     defer h.await(testing.io) catch {};
 
     ev.set(testing.io);
-    try testing.expectError(error.ConnectionReset, c.del("s"));
+    const r = try c.del("s");
+    try testing.expectEqual(protocol.ResponseCode.Ok, r.code);
 
     try h.await(testing.io);
 }
@@ -885,11 +886,19 @@ fn client_reattempts_connect_server(
         },
     }
 
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
     var srv: Server = .{ .socket = sock.* };
     var s = try srv.accept(testing.io);
-    var r_buf: [1]u8 = undefined;
+
+    var r_buf: [256]u8 = undefined;
+    var w_buf: [256]u8 = undefined;
     var r = s.reader(testing.io, &r_buf);
-    try r.interface.fill(1);
+    var w = s.writer(testing.io, &w_buf);
+
+    try expect_request(arena.allocator(), &r.interface, &w.interface, .del, "s", "", .Ok, "");
+
     s.close(testing.io);
 }
 
