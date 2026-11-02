@@ -407,30 +407,22 @@ fn do_request_read_response(
 ) ReadResponseError!Response {
     var frame: [5]u8 = undefined;
 
-    const n_read = self.first_read(&frame, deadline) catch |e|
-        return switch (e) {
-            error.Eof => error.UnexpectedEof,
-            else => |e2| e2,
-        };
-
-    if (n_read < frame.len) {
-        syscall.recv_all(
-            self.sock_fd,
-            frame[n_read..],
-            deadline,
-            self.io,
-            null,
+    syscall.recv_all(
+        self.sock_fd,
+        &frame,
+        deadline,
+        self.io,
+        null,
+        &self.unexpected,
+    ) catch |e| return switch (e) {
+        error.Timeout => error.ReadTimeout,
+        error.Badf => syscall.zerrno_bug("read", e),
+        error.ConnectionRefused => syscall.record_unexpected_errno(
             &self.unexpected,
-        ) catch |e| return switch (e) {
-            error.Timeout => error.ReadTimeout,
-            error.Badf => syscall.zerrno_bug("read", e),
-            error.ConnectionRefused => syscall.record_unexpected_errno(
-                &self.unexpected,
-                linux.E.CONNREFUSED,
-            ),
-            else => |e2| e2,
-        };
-    }
+            linux.E.CONNREFUSED,
+        ),
+        else => |e2| e2,
+    };
 
     var response: Response = undefined;
 
@@ -474,43 +466,6 @@ fn do_request_read_response(
         response.value = &[_]u8{};
     }
     return response;
-}
-
-fn first_read(self: *Self, frame: []u8, deadline: Clock.Timestamp) !usize {
-    if (Clock.Timestamp.now(self.io, .awake).compare(.gte, deadline)) {
-        return error.ReadTimeout;
-    }
-    var i = syscall.recv(self.sock_fd, frame, &self.unexpected) catch |e| switch (e) {
-        error.Again => 0,
-        error.OutOfMemory, error.Eof, error.Unexpected, error.ConnectionReset => |e2| return e2,
-        error.ConnectionRefused, error.Badf => syscall.zerrno_bug("read", e),
-    };
-
-    while (i == 0) {
-        var fds = syscall.pollfd(self.sock_fd, linux.POLL.IN);
-        _ = syscall.poll(
-            self.io,
-            @as(*[1]linux.pollfd, &fds),
-            deadline,
-            &self.unexpected,
-        ) catch |e| return switch (e) {
-            error.TooManyPollFds => unreachable,
-            error.Timeout => error.ReadTimeout,
-            error.OutOfMemory, error.Unexpected => |e2| e2,
-        };
-
-        i += syscall.recv(self.sock_fd, frame, &self.unexpected) catch |e| switch (e) {
-            error.Again => 0,
-            error.OutOfMemory,
-            error.Eof,
-            error.Unexpected,
-            error.ConnectionReset,
-            => |e2| return e2,
-            error.ConnectionRefused, error.Badf => syscall.zerrno_bug("read", e),
-        };
-    }
-
-    return i;
 }
 
 pub fn deinit(self: *Self) void {
