@@ -30,7 +30,49 @@ addr: linux.sockaddr.in,
 sock_fd: i32,
 timeout: Duration,
 idle_timeout: Duration,
+last_request: Clock.Timestamp,
 unexpected: linux.E,
+
+const ConnState = enum {
+    ok,
+    conn_failed,
+    error_before_write,
+    error_after_write,
+    timeout,
+    fatal,
+};
+
+const RequestState = struct {
+    conn: ConnState,
+    attempts: i32,
+    err: RequestError,
+    op: protocol.Op,
+
+    fn next(self: *RequestState) bool {
+        if (self.attempts >= max_attempts) {
+            return false;
+        }
+
+        const retval = switch (self.conn) {
+            .error_before_write, .conn_failed => true,
+            .error_after_write => switch (self.op) {
+                .get => true,
+                .set, .del => false,
+            },
+            .timeout, .fatal => false,
+            .ok => true,
+        };
+
+        if (retval) self.attempts += 1;
+
+        return retval;
+    }
+
+    fn set(self: *RequestState, state: ConnState, err: RequestError) void {
+        self.conn = state;
+        self.err = err;
+    }
+};
 
 pub const Response = struct {
     code: protocol.ResponseCode,
@@ -43,96 +85,17 @@ pub const Response = struct {
     }
 };
 
-const RequestState = struct {
-    op: protocol.Op,
-    conn_age: ConnAge,
-    conn_status: ConnStatus,
-    attempts: i32,
-
-    const ConnAge = enum {
-        no_connection,
-        old_connection,
-        new_connection,
-    };
-    const ConnStatus = union(enum) {
-        disconnected,
-        idle,
-        ready,
-        closed,
-        unusable: RequestError,
-        unusable_after_write: RequestError,
-        fatal: RequestError,
-        conn_failed: RequestError,
-    };
-    const Action = enum {
-        connect,
-        reconnect,
-        wait_connect,
-        cont,
-    };
-
-    fn init(fd: i32, op: protocol.Op) RequestState {
-        return .{
-            .conn_age = if (fd < 0) .no_connection else .old_connection,
-            .conn_status = .ready,
-            .attempts = 0,
-            .op = op,
-        };
-    }
-
-    fn next(self: *RequestState) ?Action {
-        if (self.attempts > max_attempts) {
-            return null;
-        }
-
-        if (!(self.conn_age == .old_connection and self.conn_status == .closed)) {
-            self.attempts += 1;
-        }
-
-        const action: ?Action = switch (self.conn_status) {
-            .idle => unreachable,
-            .disconnected => .connect,
-            .ready => .cont,
-            .unusable, .closed => .reconnect,
-            .unusable_after_write => switch (self.op) {
-                .get => .reconnect,
-                .set, .del => null,
-            },
-            .fatal => null,
-            .conn_failed => .wait_connect,
-        };
-
-        if (action) |a| switch (a) {
-            .reconnect, .connect, .wait_connect => self.conn_age = .new_connection,
-            .cont => {},
-        };
-
-        return action;
-    }
-
-    fn set(self: *RequestState, status: ConnStatus) void {
-        self.conn_status = status;
-    }
-
-    fn err(self: RequestState) RequestError {
-        return switch (self.conn_status) {
-            .idle, .ready, .disconnected => unreachable,
-            .closed => RequestError.ClosedByPeer,
-            .unusable_after_write, .fatal, .conn_failed, .unusable => |e| e,
-        };
-    }
-};
-
 pub fn init(
     self: *Self,
     io: Io,
     addr: []const u8,
 ) error{InvalidAddress}!void {
     self.io = io;
+    self.last_request = undefined;
     self.addr = syscall.parse_addr(addr) orelse return error.InvalidAddress;
     self.sock_fd = -1;
     self.timeout = .fromSeconds(6);
-    self.idle_timeout = .fromSeconds(10);
+    self.idle_timeout = .fromSeconds(8);
 }
 
 pub const ConnectError = error{
@@ -175,6 +138,7 @@ pub fn del(self: *Self, key: []const u8) !Response {
 }
 
 const RequestError = error{
+    Pipe,
     PermissionDenied,
     TooManyOpenFiles,
     OutOfMemory,
@@ -200,111 +164,81 @@ fn do_request(
     op: protocol.Op,
     data: *[3][]const u8,
 ) !Response {
-    errdefer {
+    const deadline = self.create_deadline(self.timeout);
+    var req_state: RequestState = .{ .conn = .ok, .err = undefined, .attempts = 0, .op = op };
+
+    if (self.sock_fd >= 0 and self.idle_connection_is_expired()) {
+        self.close_fd();
+    }
+
+    const result = while (req_state.next()) {
+        const connect_result = switch (req_state.conn) {
+            .ok => if (self.sock_fd == -1) self.connect(deadline),
+            .conn_failed => blk: {
+                self.io.sleep(retry_connect_delay, .awake) catch unreachable;
+                break :blk self.connect(deadline);
+            },
+            else => self.reconnect(deadline),
+        };
+
+        connect_result catch |err| {
+            switch (err) {
+                error.AlreadyConnected => unreachable,
+                error.PermissionDenied,
+                error.TooManyOpenFiles,
+                error.OutOfMemory,
+                error.ConnectionRefused,
+                error.NoAddressAvailable,
+                error.Unreachable,
+                error.NetworkTimeout,
+                error.Unexpected,
+                => |e| req_state.set(.conn_failed, e),
+                error.Timeout => req_state.set(.timeout, error.ConnectTimeout),
+                error.InvalidAddress => |e| req_state.set(.fatal, e),
+            }
+            continue;
+        };
+
+        self.writev_all(data, deadline) catch |err| {
+            switch (err) {
+                error.WriteTimeout => |e| req_state.set(.timeout, e),
+                error.Pipe,
+                error.OutOfMemory,
+                error.Unexpected,
+                error.ConnectionReset,
+                => |e| req_state.set(.error_before_write, e),
+                error.Badf,
+                error.NotConnected,
+                error.NotSock,
+                => syscall.zerrno_bug("write", err),
+            }
+            continue;
+        };
+
+        break self.do_request_read_response(allocator, op, deadline) catch |err| {
+            switch (err) {
+                error.ReadTimeout => |e| req_state.set(.timeout, e),
+                error.OutOfMemory,
+                error.Unexpected,
+                error.ConnectionReset,
+                error.UnexpectedEof,
+                error.BadResponse,
+                => |e| req_state.set(.error_after_write, e),
+            }
+            continue;
+        };
+    } else req_state.err;
+
+    if (result) |_| {
+        self.last_request = self.now();
+    } else |err| {
         if (self.sock_fd >= 0) {
             self.close_fd();
         }
-    }
-
-    const deadline = self.create_deadline(self.timeout);
-
-    var request_state: RequestState = .init(self.sock_fd, op);
-
-    if (self.sock_fd >= 0) {
-        request_state.set(.idle);
-    } else {
-        request_state.set(.disconnected);
-    }
-
-    if (request_state.conn_status == .idle) {
-        if (self.check_connection()) |state| {
-            switch (state) {
-                .up => request_state.set(.ready),
-                .down => request_state.set(.closed),
-            }
-        } else |err| {
-            switch (err) {
-                error.ConnectionReset,
-                error.UnexpectedBytes,
-                error.Unexpected,
-                error.OutOfMemory,
-                => |e| request_state.set(.{ .unusable = e }),
-            }
-        }
-    }
-
-    const result =
-        while (request_state.next()) |action| {
-            const connect_result = switch (action) {
-                .cont => {},
-                .connect => self.connect(deadline),
-                .reconnect => self.reconnect(deadline),
-                .wait_connect => blk: {
-                    self.io.sleep(retry_connect_delay, .awake) catch unreachable;
-                    break :blk self.connect(deadline);
-                },
-            };
-
-            connect_result catch |err| {
-                switch (err) {
-                    error.AlreadyConnected => unreachable,
-
-                    error.PermissionDenied,
-                    error.TooManyOpenFiles,
-                    error.OutOfMemory,
-                    error.ConnectionRefused,
-                    error.NoAddressAvailable,
-                    error.Unreachable,
-                    error.NetworkTimeout,
-                    error.Unexpected,
-                    => |e| request_state.set(.{ .conn_failed = e }),
-
-                    error.Timeout => request_state.set(.{ .fatal = error.ConnectTimeout }),
-
-                    error.InvalidAddress => |e| request_state.set(.{ .fatal = e }),
-                }
-                continue;
-            };
-
-            self.writev_all(data, deadline) catch |err| {
-                switch (err) {
-                    error.WriteTimeout => |e| request_state.set(.{ .fatal = e }),
-
-                    error.Pipe => request_state.set(.closed),
-
-                    error.OutOfMemory,
-                    error.Unexpected,
-                    error.ConnectionReset,
-                    => |e| request_state.set(.{ .unusable = e }),
-
-                    error.Badf,
-                    error.NotConnected,
-                    error.NotSock,
-                    => syscall.zerrno_bug("write", err),
-                }
-                continue;
-            };
-
-            break self.do_request_read_response(allocator, op, deadline) catch |err| {
-                switch (err) {
-                    error.ConnectionWasClosed => request_state.set(.closed),
-                    error.ReadTimeout => |e| request_state.set(.{ .fatal = e }),
-                    error.OutOfMemory,
-                    error.Unexpected,
-                    error.ConnectionReset,
-                    error.UnexpectedEof,
-                    error.BadResponse,
-                    => |e| request_state.set(.{ .unusable_after_write = e }),
-                }
-                continue;
-            };
-        } else request_state.err();
-
-    _ = result catch |err| {
         if (err == error.Unexpected) {
             std.debug.print("unexpected syscall error: {t}\n", .{self.unexpected});
         }
-    };
+    }
 
     return result;
 }
@@ -457,7 +391,6 @@ fn writev_all(self: *Self, data: *[3][]const u8, deadline: Clock.Timestamp) !voi
 }
 
 const ReadResponseError = error{
-    ConnectionWasClosed,
     ReadTimeout,
     UnexpectedEof,
     BadResponse,
@@ -476,7 +409,7 @@ fn do_request_read_response(
 
     const n_read = self.first_read(&frame, deadline) catch |e|
         return switch (e) {
-            error.Eof => error.ConnectionWasClosed,
+            error.Eof => error.UnexpectedEof,
             else => |e2| e2,
         };
 
@@ -580,22 +513,6 @@ fn first_read(self: *Self, frame: []u8, deadline: Clock.Timestamp) !usize {
     return i;
 }
 
-fn check_connection(self: *Self) !enum { up, down } {
-    var buf: [1]u8 = undefined;
-    const recv_rc = linux.recvfrom(self.sock_fd, &buf, buf.len, linux.MSG.PEEK, null, null);
-    while (true) {
-        return switch (errno(recv_rc)) {
-            .AGAIN => .up,
-            .SUCCESS => if (recv_rc == 0) .down else error.UnexpectedBytes,
-            .INTR => continue,
-            .CONNRESET => error.ConnectionReset,
-            .NOMEM => error.OutOfMemory,
-            .BADF, .CONNREFUSED, .FAULT, .INVAL, .NOTCONN => |e| syscall.errno_bug("recvfrom", e),
-            else => |e| syscall.record_unexpected_errno(&self.unexpected, e),
-        };
-    }
-}
-
 pub fn deinit(self: *Self) void {
     if (self.sock_fd < 0) {
         return;
@@ -625,6 +542,12 @@ fn create_deadline(self: Self, duration: Duration) Clock.Timestamp {
 
 fn now(self: Self) Clock.Timestamp {
     return .now(self.io, .awake);
+}
+
+fn idle_connection_is_expired(self: Self) bool {
+    return self.last_request
+        .addDuration(.{ .clock = .awake, .raw = self.idle_timeout })
+        .compare(.lt, self.now());
 }
 
 const TestServer = struct {
