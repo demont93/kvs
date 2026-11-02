@@ -21,7 +21,6 @@ const syscall = @import("syscall.zig");
 
 const Self = @This();
 
-const max_attempts: i32 = 3;
 const retry_connect_delay: Duration = .fromMilliseconds(100);
 
 io: Io,
@@ -32,6 +31,7 @@ timeout: Duration,
 idle_timeout: Duration,
 last_request: Clock.Timestamp,
 unexpected: linux.E,
+max_attempts: i32,
 
 const ConnState = enum {
     ok,
@@ -45,11 +45,22 @@ const ConnState = enum {
 const RequestState = struct {
     conn: ConnState,
     attempts: i32,
+    max_attempts: i32,
     err: RequestError,
     op: protocol.Op,
 
+    fn init(op: protocol.Op, max_attempts: i32) RequestState {
+        return .{
+            .conn = .ok,
+            .attempts = 0,
+            .max_attempts = max_attempts,
+            .err = undefined,
+            .op = op,
+        };
+    }
+
     fn next(self: *RequestState) bool {
-        if (self.attempts >= max_attempts) {
+        if (self.attempts >= self.max_attempts) {
             return false;
         }
 
@@ -85,17 +96,25 @@ pub const Response = struct {
     }
 };
 
+pub const ClientOpts = struct {
+    timeout: Duration = .fromSeconds(6),
+    idle_timeout: Duration = .fromSeconds(8),
+    max_attempts: i32 = 3,
+};
+
 pub fn init(
     self: *Self,
     io: Io,
     addr: []const u8,
+    opts: ClientOpts,
 ) error{InvalidAddress}!void {
     self.io = io;
     self.last_request = undefined;
     self.addr = syscall.parse_addr(addr) orelse return error.InvalidAddress;
     self.sock_fd = -1;
-    self.timeout = .fromSeconds(6);
-    self.idle_timeout = .fromSeconds(8);
+    self.timeout = opts.timeout;
+    self.idle_timeout = opts.idle_timeout;
+    self.max_attempts = opts.max_attempts;
 }
 
 pub const ConnectError = error{
@@ -165,7 +184,7 @@ fn do_request(
     data: *[3][]const u8,
 ) !Response {
     const deadline = self.create_deadline(self.timeout);
-    var req_state: RequestState = .{ .conn = .ok, .err = undefined, .attempts = 0, .op = op };
+    var req_state: RequestState = .init(op, self.max_attempts);
 
     if (self.sock_fd >= 0 and self.idle_connection_is_expired()) {
         self.close_fd();
@@ -666,7 +685,7 @@ test "client connects" {
     var w = Io.Writer.fixed(&str_addr);
     try addr.ip4.format(&w);
 
-    try c.init(testing.io, str_addr[0..w.end]);
+    try c.init(testing.io, str_addr[0..w.end], .{});
 
     try c.connect(.fromNow(testing.io, .{ .raw = .fromMilliseconds(200), .clock = .awake }));
 
@@ -742,7 +761,7 @@ test "send request receive response" {
     var t = try Tester.init_connection(send_request_receive_response_server);
     defer t.deinit();
     const addr = try t.str_addr();
-    try t.client.init(testing.io, addr);
+    try t.client.init(testing.io, addr, .{});
     defer t.client.deinit();
     var resp = try t.client.set("hola", "chao");
     defer resp.deinit(testing.allocator);
@@ -761,7 +780,7 @@ test "multiple requests" {
     var t = try Tester.init_connection(multiple_requests_server);
     defer t.deinit();
     const addr = try t.str_addr();
-    try t.client.init(testing.io, addr);
+    try t.client.init(testing.io, addr, .{});
     defer t.client.deinit();
     var resp1 = try t.client.del("something else gigantic");
     try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
@@ -781,7 +800,7 @@ test "client reconnects on stale connection" {
     var t = try Tester.init_connection(client_reconnects_on_stale_connection_server);
     defer t.deinit();
     const addr = try t.str_addr();
-    try t.client.init(testing.io, addr);
+    try t.client.init(testing.io, addr, .{});
     defer t.client.deinit();
 
     var resp1 = try t.client.set("something", &.{});
@@ -822,7 +841,7 @@ test "reattempts connect" {
     try srv_sock.address.format(&str_w.writer);
 
     var c: Self = undefined;
-    try c.init(testing.io, str_w.written());
+    try c.init(testing.io, str_w.written(), .{});
     defer c.deinit();
 
     var ev: Io.Event = .unset;
@@ -870,7 +889,7 @@ test "retries idempotent after half reading response" {
     var t: Tester = try .init_connection(retries_get_server);
     defer t.deinit();
 
-    try t.client.init(testing.io, try t.str_addr());
+    try t.client.init(testing.io, try t.str_addr(), .{});
     defer t.client.deinit();
 
     const resp = try t.client.get(t.arena(), "my key");
@@ -899,7 +918,7 @@ test "failed request cleans up the socket fd" {
     var t: Tester = try .init_connection(failed_request_cleans_up_fd);
     defer t.deinit();
 
-    try t.client.init(testing.io, try t.str_addr());
+    try t.client.init(testing.io, try t.str_addr(), .{});
     defer t.client.deinit();
 
     try testing.expectError(error.UnexpectedEof, t.client.del("."));
