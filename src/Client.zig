@@ -100,16 +100,6 @@ const Request = struct {
         );
     }
 
-    fn log_return(self: *Request, err_log: anytype, err: anytype) @TypeOf(err) {
-        self.log_err(err_log);
-        return err;
-    }
-
-    fn log_unexpected(self: *Request, err: anytype) error{Unexpected} {
-        self.log_err(err);
-        return error.Unexpected;
-    }
-
     fn check_deadline(self: *Request, io: Io) error{Timeout}!void {
         if (Clock.Timestamp.now(io, .awake).compare(.gte, self.deadline)) {
             return error.Timeout;
