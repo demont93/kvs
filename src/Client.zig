@@ -83,14 +83,10 @@ const Request = struct {
     }
 
     fn get_error(self: Request) RequestError {
-        if (self.conn_state == .error_after_write and
-            !self.op.is_read_only() and
-            self.err == error.ConnectionError)
-        {
-            return error.UnknownOutcome;
-        } else {
+        return if (self.conn_state == .error_after_write and !self.op.is_read_only())
+            error.UnknownOutcome
+        else
             return self.err;
-        }
     }
 
     fn log_err(self: *Request, err: anytype) void {
