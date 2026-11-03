@@ -973,3 +973,68 @@ fn failed_request_cleans_up_fd(srv: *TestServer, t: *TestShared) !void {
     try s.expect_req(t.arena(), .set, "set", "hola", .Ok, "");
     s.close();
 }
+
+test "unknown outcome if rst after write" {
+    var t: Tester = try .init_connection(unknown_outcome_error_rst_after_write_server);
+    defer t.deinit();
+
+    try t.client.init(testing.io, try t.str_addr(), .{});
+    defer t.client.deinit();
+
+    try testing.expectError(error.UnknownOutcome, t.client.set(&.{ 255, 0 }, &.{ 255, 0 }));
+    try t.join();
+}
+
+fn unknown_outcome_error_rst_after_write_server(srv: *TestServer, t: *TestShared) !void {
+    var s = try srv.accept();
+
+    const expected = try protocol.encode.encode_client_msg_alloc(
+        .set,
+        &.{ 255, 0 },
+        &.{ 255, 0 },
+        t.arena(),
+    );
+    const actual = try s.r.interface.readAlloc(t.arena(), expected.len);
+    try testing.expectEqualSlices(u8, expected, actual);
+
+    const linger: linux.linger = .{ .linger = 0, .onoff = 1 };
+    const sso_rc = linux.setsockopt(
+        s.stream.socket.handle,
+        linux.SOL.SOCKET,
+        linux.SO.LINGER,
+        @ptrCast(&linger),
+        @sizeOf(linux.linger),
+    );
+    switch (errno(sso_rc)) {
+        .SUCCESS => {},
+        else => return testing.expect(false),
+    }
+
+    s.close();
+}
+
+test "unknown outcome if fin after write" {
+    var t: Tester = try .init_connection(unknown_outcome_error_fin_after_write_server);
+    defer t.deinit();
+
+    try t.client.init(testing.io, try t.str_addr(), .{});
+    defer t.client.deinit();
+
+    try testing.expectError(error.UnknownOutcome, t.client.set(&.{ 255, 0 }, &.{ 255, 0 }));
+    try t.join();
+}
+
+fn unknown_outcome_error_fin_after_write_server(srv: *TestServer, t: *TestShared) !void {
+    var s = try srv.accept();
+
+    const expected = try protocol.encode.encode_client_msg_alloc(
+        .set,
+        &.{ 255, 0 },
+        &.{ 255, 0 },
+        t.arena(),
+    );
+    const actual = try s.r.interface.readAlloc(t.arena(), expected.len);
+    try testing.expectEqualSlices(u8, expected, actual);
+
+    s.close();
+}
