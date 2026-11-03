@@ -10,6 +10,11 @@ const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expect = testing.expect;
 const expectEqualSlices = testing.expectEqualSlices;
+const Duration = std.Io.Duration;
+const panic = debug.panic;
+const assert = debug.assert;
+const Random = std.Random;
+const Io = std.Io;
 
 pub const max_key_size = 64 * 1024;
 pub const max_value_size = 16 * 1024 * 1024;
@@ -290,6 +295,38 @@ pub const encode = struct {
     }
 };
 
+pub fn exponential_backoff_with_jitter(
+    io: Io,
+    random: Random,
+    attempt: i32,
+    base: Duration,
+    cap: Duration,
+) error{Canceled}!void {
+    const backoff = calculate_exponential_backoff(attempt, base, cap);
+    const with_jitter = random.intRangeAtMost(
+        i96,
+        base.nanoseconds,
+        backoff.nanoseconds,
+    );
+    const dur: Duration = .{ .nanoseconds = with_jitter };
+    try io.sleep(dur, .awake);
+}
+
+/// Asserts:
+/// - base > 0
+/// - attempt > 0
+/// - cap > 0
+inline fn calculate_exponential_backoff(attempt: i32, base: Duration, cap: Duration) Duration {
+    assert(base.nanoseconds > 0);
+    assert(attempt > 0);
+    assert(cap.nanoseconds > 0);
+
+    const capped_attempt: u7 = @intCast(@as(i32, @min((attempt - 1), 95)));
+    const backoff: i96 = math.mul(i96, (@as(i96, 1) << capped_attempt), base.nanoseconds) catch
+        math.maxInt(i96);
+    return .{ .nanoseconds = @min(backoff, cap.nanoseconds) };
+}
+
 test "full message returns correct request" {
     const alloc = testing.allocator;
     var parser = Parser{};
@@ -462,3 +499,60 @@ const parser_tester = struct {
         return buf;
     }
 };
+
+test "exponential backoff correct cap" {
+    const Case = struct {
+        cap: Duration,
+        attempt: i32,
+        base: Duration,
+        expected: Duration,
+    };
+
+    const cases = [_]Case{
+        .{
+            .base = .fromMilliseconds(100),
+            .attempt = 4,
+            .cap = .fromMilliseconds(4000),
+            .expected = .fromMilliseconds(800),
+        },
+        .{
+            .base = .fromMilliseconds(200),
+            .attempt = 4,
+            .cap = .fromMilliseconds(500),
+            .expected = .fromMilliseconds(500),
+        },
+        .{
+            .base = .max,
+            .attempt = 1,
+            .cap = .fromMilliseconds(3),
+            .expected = .fromMilliseconds(3),
+        },
+        .{
+            .base = .max,
+            .attempt = 5,
+            .cap = .fromMilliseconds(3),
+            .expected = .fromMilliseconds(3),
+        },
+        .{
+            .base = .max,
+            .attempt = math.maxInt(i32),
+            .cap = .max,
+            .expected = .max,
+        },
+        .{
+            .base = .fromMilliseconds(1),
+            .attempt = 4,
+            .cap = .fromMilliseconds(4),
+            .expected = .fromMilliseconds(4),
+        },
+    };
+
+    for (&cases) |*c| {
+        const result = calculate_exponential_backoff(
+            c.attempt,
+            c.base,
+            c.cap,
+        );
+        try expectEqual(c.expected, result);
+    }
+}
