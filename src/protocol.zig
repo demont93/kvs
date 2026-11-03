@@ -6,6 +6,10 @@ const heap = std.heap;
 const Allocator = mem.Allocator;
 const math = std.math;
 const debug = std.debug;
+const testing = std.testing;
+const expectEqual = testing.expectEqual;
+const expect = testing.expect;
+const expectEqualSlices = testing.expectEqualSlices;
 
 pub const max_key_size = 64 * 1024;
 pub const max_value_size = 16 * 1024 * 1024;
@@ -285,11 +289,6 @@ pub const encode = struct {
         return buf;
     }
 };
-
-const testing = std.testing;
-const expectEqual = testing.expectEqual;
-const expect = testing.expect;
-const expectEqualSlices = testing.expectEqualSlices;
 
 test "full message returns correct request" {
     const alloc = testing.allocator;
