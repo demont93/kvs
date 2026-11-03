@@ -20,3 +20,7 @@ The naive implementation polled before each read or write. Considering that the 
 ## A simple client
 
 In order to measure the next steps and take informed decisions, the next logical step is creating a client so we can check many of the claims. Most tests will require opening several connections with the server to test epoll.
+
+## FSM on client
+
+Implemented an FSM on the client to manage all the different states in which the connection can be. Before the fsm, the conditions where all over the place for retrying, errors, state of the connection. The FSM made it easy to have all the state that decides the next transition in one place.

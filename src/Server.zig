@@ -14,6 +14,7 @@ const assert = debug.assert;
 const Clock = Io.Clock.awake;
 const BufMap = std.BufMap;
 const encode = protocol.encode;
+const syscall = @import("syscall.zig");
 
 const protocol = @import("protocol.zig");
 
@@ -26,88 +27,55 @@ pub const Listener = struct {
 
         pub const RwError = error{
             ConnectionReset,
-            NetworkDown,
-            Unreachable,
-            Unexpected,
             WouldBlock,
+            Unexpected,
         };
 
-        pub fn read(self: *Connection, buf: []u8) RwError!usize {
+        pub fn read(self: *Connection, buf: []u8, unexpected: *linux.E) RwError!usize {
             return while (true) {
                 const read_rc = linux.read(self.sock_fd, buf.ptr, buf.len);
                 switch (linux.errno(read_rc)) {
                     .SUCCESS => break read_rc,
                     .INTR => continue,
                     .CONNRESET, .PIPE => return RwError.ConnectionReset,
-                    .NETDOWN => return RwError.NetworkDown,
                     .AGAIN => return RwError.WouldBlock,
-                    .TIMEDOUT,
-                    .HOSTUNREACH,
-                    .NETUNREACH,
-                    .HOSTDOWN,
-                    .NONET,
-                    => return RwError.Unreachable,
                     .BADF,
                     .FAULT,
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| unexpected_syscall("read", e),
-                    else => |e| {
-                        log_syscall_err("read", e);
-                        return RwError.Unexpected;
-                    },
+                    => |e| syscall.errno_bug("read", e),
+                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
                 }
             };
         }
 
-        pub fn write(self: *Connection, buf: []const u8) RwError!usize {
+        pub fn write(self: *Connection, buf: []const u8, unexpected: *linux.E) RwError!usize {
             return while (true) {
                 const write_rc = linux.write(self.sock_fd, buf.ptr, buf.len);
                 switch (linux.errno(write_rc)) {
                     .SUCCESS => break write_rc,
                     .INTR => continue,
                     .CONNRESET, .PIPE => return RwError.ConnectionReset,
-                    .NETDOWN => return RwError.NetworkDown,
                     .AGAIN => return RwError.WouldBlock,
-                    .TIMEDOUT,
-                    .HOSTUNREACH,
-                    .NETUNREACH,
-                    .HOSTDOWN,
-                    .NONET,
-                    => return RwError.Unreachable,
                     .BADF,
                     .FAULT,
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| unexpected_syscall("write", e),
-                    else => |e| {
-                        log_syscall_err("write", e);
-                        return RwError.Unexpected;
-                    },
+                    => |e| syscall.errno_bug("write", e),
+                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
                 }
             };
         }
 
         const ReadExactError = error{UnexpectedEof} || RwError;
 
-        pub fn read_exact(self: *Connection, buf: []u8) ReadExactError!void {
-            var i: usize = 0;
-            while (i < buf.len) {
-                const n = try self.read(buf[i..buf.len]);
-                if (n == 0) {
-                    return ReadExactError.UnexpectedEof;
-                }
-                i += n;
-            }
-        }
-
         pub fn shutdown(self: *Connection) void {
             const shut_rc = linux.shutdown(self.sock_fd, linux.SHUT.WR);
             switch (linux.errno(shut_rc)) {
                 .SUCCESS, .NOTCONN => {},
-                else => |e| unexpected_syscall("shutdown", e),
+                else => |e| syscall.errno_bug("shutdown", e),
             }
         }
 
@@ -115,8 +83,8 @@ pub const Listener = struct {
             const rc = linux.close(self.sock_fd);
             switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| unexpected_syscall("close", e),
-                else => |e| log_syscall_err("close", e),
+                .BADF => |e| syscall.errno_bug("close", e),
+                else => |e| log_err("closing connection", e),
             }
             self.sock_fd = -1;
             return;
@@ -135,13 +103,13 @@ pub const Listener = struct {
     };
 
     fn bind(self: *Listener, addr: []const u8) BindError!void {
-        const socket_rc = linux.socket(linux.AF.INET, linux.SOCK.STREAM, 0);
+        const socket_rc = syscall.socket(.Blocking);
         switch (linux.errno(socket_rc)) {
             .SUCCESS => self.sock_fd = @intCast(socket_rc),
             .ACCES => return BindError.PermissionDenied,
             .MFILE, .NFILE => return BindError.TooManyOpenFiles,
             .NOBUFS, .NOMEM => return BindError.InsufficientMemory,
-            else => |e| unexpected_syscall("socket", e),
+            else => |e| syscall.errno_bug("socket", e),
         }
 
         const optval: c_int = 1;
@@ -154,12 +122,10 @@ pub const Listener = struct {
         );
         switch (linux.errno(sso_rc)) {
             .SUCCESS => {},
-            else => |e| unexpected_syscall("setsockopt", e),
+            else => |e| syscall.errno_bug("setsockopt", e),
         }
 
-        const addr_u, const port_u = Listener.parse_addr(addr) orelse
-            return BindError.InvalidAddress;
-        const sock_addr = linux.sockaddr.in{ .addr = addr_u, .port = port_u };
+        const sock_addr = syscall.parse_addr(addr) orelse return BindError.InvalidAddress;
         const bind_rc = linux.bind(
             self.sock_fd,
             @ptrCast(&sock_addr),
@@ -170,14 +136,14 @@ pub const Listener = struct {
             .ACCES, .ADDRNOTAVAIL, .FAULT => return BindError.InvalidAddress,
             .ADDRINUSE => return BindError.AddressInUse,
             .NOMEM => return BindError.InsufficientMemory,
-            else => |e| unexpected_syscall("bind", e),
+            else => |e| syscall.errno_bug("bind", e),
         }
 
         const listen_rc = linux.listen(self.sock_fd, self.backlog);
         switch (linux.errno(listen_rc)) {
             .SUCCESS => {},
             .ADDRINUSE => return BindError.AddressInUse,
-            else => |e| unexpected_syscall("listen", e),
+            else => |e| syscall.errno_bug("listen", e),
         }
     }
 
@@ -206,15 +172,23 @@ pub const Listener = struct {
                 .NOBUFS, .NOMEM => return AcceptError.InsufficientMemory,
                 .PERM => return AcceptError.Firewall,
                 .NETDOWN,
-                .PROTO,
                 .NOPROTOOPT,
                 .HOSTDOWN,
                 .NONET,
                 .HOSTUNREACH,
-                .OPNOTSUPP,
                 .NETUNREACH,
                 => continue,
-                else => |e| unexpected_syscall("accept", e),
+                .BADF,
+                .FAULT,
+                .INVAL,
+                .OPNOTSUPP,
+                .PROTO,
+                .AGAIN,
+                => |e| syscall.errno_bug("accept", e),
+                else => |e| {
+                    log_err("unexpected accept error", e);
+                    continue;
+                },
             };
             break conn_sock_fd;
         };
@@ -222,70 +196,13 @@ pub const Listener = struct {
         return Connection{ .sock_fd = conn_sock_fd };
     }
 
-    fn parse_addr(addr: []const u8) ?struct { u32, u16 } {
-        var addr_u: u32 = 0;
-        var octet: u32 = 0;
-        var i: usize = 0;
-        var pos: i32 = 0;
-        var is_zero = false;
-
-        for (0..4) |n_octet| {
-            octet = 0;
-            pos = 0;
-            is_zero = false;
-
-            while (i < addr.len and pos < 3 and addr[i] >= '0' and addr[i] <= '9') {
-                if (pos == 0 and addr[i] == '0') is_zero = true;
-                if (pos == 1 and is_zero) return null;
-
-                octet *= 10;
-                octet += addr[i] - '0';
-
-                pos += 1;
-                i += 1;
-            }
-            if (i == addr.len or
-                pos == 0 or
-                (n_octet == 3 and addr[i] != ':') or
-                (n_octet < 3 and addr[i] != '.') or
-                octet > math.maxInt(u8))
-            {
-                return null;
-            }
-
-            addr_u <<= 8;
-            addr_u |= octet;
-            i += 1;
-        }
-
-        var port: u32 = 0;
-        const port_start = i;
-        is_zero = false;
-        while (i < addr.len and port <= math.maxInt(u16) and addr[i] >= '0' and addr[i] <= '9') {
-            if (i == port_start and addr[i] == '0') is_zero = true;
-            if (i == port_start + 1 and is_zero) return null;
-            port *= 10;
-            port += addr[i] - '0';
-
-            i += 1;
-        }
-        if (i < addr.len or i == port_start or port > math.maxInt(u16)) {
-            return null;
-        }
-
-        return switch (builtin.target.cpu.arch.endian()) {
-            .big => .{ addr_u, @truncate(port) },
-            .little => .{ @byteSwap(addr_u), @byteSwap(@as(u16, @truncate(port))) },
-        };
-    }
-
     pub fn close(self: *Listener) void {
         if (self.sock_fd != -1) {
             const close_rc = linux.close(self.sock_fd);
             switch (linux.errno(close_rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| unexpected_syscall("close", e),
-                else => |e| log_syscall_err("close", e),
+                .BADF => |e| syscall.errno_bug("close", e),
+                else => |e| log_err("closing listener", e),
             }
         }
     }
@@ -301,7 +218,7 @@ pub const Listener = struct {
             .SUCCESS => {},
             .FAULT, .INVAL => return AddrError.InvalidAddr,
             .NOBUFS => return AddrError.InsufficientMemory,
-            else => |e| unexpected_syscall("getsockname", e),
+            else => |e| syscall.errno_bug("getsockname", e),
         }
     }
 };
@@ -406,6 +323,7 @@ grace_period: Io.Duration,
 parser: protocol.Parser,
 allocator: Allocator,
 retry_state: RetryState,
+unexpected_errno: linux.E,
 
 map: BufMap,
 
@@ -471,11 +389,17 @@ pub fn listen_and_serve(
 
         const result = self.handle_connection(&conn, &diag);
         conn.close();
-        result catch {
-            debug.print(
-                "connection error {} while {s}\n",
-                .{ diag.details, diag.action.description() },
-            );
+        result catch |e| {
+            switch (e) {
+                error.Unexpected => log(
+                    "connection error: unexpected {t}",
+                    .{self.unexpected_errno},
+                ),
+                else => debug.print(
+                    "connection error {t} while {s}\n",
+                    .{ diag.details, diag.action.description() },
+                ),
+            }
         };
     }
 }
@@ -499,6 +423,15 @@ pub fn close(self: *Self) void {
     self.map.deinit();
 }
 
+const RequestError = error{
+    ConnectionReset,
+    ReadTimeout,
+    WriteTimeout,
+    OutOfMemory,
+    BadRequest,
+    Unexpected,
+};
+
 fn handle_connection(
     self: *Self,
     conn: *Listener.Connection,
@@ -516,14 +449,6 @@ const RequestResult = enum {
     Continue,
 };
 
-const RequestError = error{
-    ConnectionUnusable,
-    BadRequest,
-    ReadTimeout,
-    Unexpected,
-    OutOfMemory,
-};
-
 fn handle_request(
     self: *Self,
     conn: *Listener.Connection,
@@ -537,14 +462,14 @@ fn handle_request(
     }
 
     const read_result = self.read_request(conn, diag, &req) catch |err| {
-        const response = switch (err) {
-            error.ConnectionUnusable => |e| return e,
-            error.OutOfMemory, error.Unexpected => encode.internal,
+        const error_response = switch (err) {
+            error.ConnectionReset, error.Unexpected => |e| return e,
+            error.OutOfMemory => encode.internal,
             error.BadRequest => encode.invalid,
             error.ReadTimeout => encode.timeout,
         };
-        self.write_drain(conn, response);
-        return err;
+        self.write_drain(conn, error_response);
+        return @errorCast(err);
     };
 
     switch (read_result) {
@@ -561,17 +486,8 @@ fn handle_request(
     }
 
     self.write_all(conn, response) catch |err| {
-        const err_out = switch (err) {
-            error.ConnectionReset,
-            error.NetworkDown,
-            error.Unreachable,
-            error.WriteTimeout,
-            => RequestError.ConnectionUnusable,
-            error.Unexpected => RequestError.Unexpected,
-            error.OutOfMemory => |e| e,
-        };
         diag.record(.Write, err);
-        return err_out;
+        return @errorCast(err);
     };
 
     return .Continue;
@@ -615,7 +531,7 @@ fn handler(
 }
 
 const ReadRequestError = error{
-    ConnectionUnusable,
+    ConnectionReset,
     OutOfMemory,
     BadRequest,
     ReadTimeout,
@@ -640,13 +556,9 @@ fn read_request(
         ) catch |e| {
             const err = switch (e) {
                 error.ReadTimeout => return .Done,
-                error.OutOfMemory, error.Unexpected => |e2| e2,
-                error.ConnectionReset,
-                error.NetworkDown,
-                error.Unreachable,
-                => error.ConnectionUnusable,
+                else => |err| return err,
             };
-            diag.record(.FirstRead, e);
+            diag.record(.FirstRead, err);
             return err;
         };
         if (chunk.len == 0) {
@@ -664,15 +576,8 @@ fn read_request(
     while (!done) {
         const needed = self.parser.bytes_required();
         const chunk = self.read_buffered(conn, needed, deadline) catch |e| {
-            const err = switch (e) {
-                error.ReadTimeout, error.OutOfMemory, error.Unexpected => |e2| e2,
-                error.ConnectionReset,
-                error.NetworkDown,
-                error.Unreachable,
-                => error.ConnectionUnusable,
-            };
             diag.record(.SubsequentReads, e);
-            return err;
+            return e;
         };
         if (chunk.len == 0) {
             diag.record(.SubsequentReads, error.UnexpectedEof);
@@ -704,8 +609,6 @@ const ReadError = error{
     ReadTimeout,
     OutOfMemory,
     ConnectionReset,
-    NetworkDown,
-    Unreachable,
     Unexpected,
 };
 
@@ -717,44 +620,30 @@ fn read_buffered(
 ) ReadError![]u8 {
     var chunk = self.read_buf.contents(size);
     if (chunk.len == 0) {
-        var pollfd = linux.pollfd{
-            .fd = conn.sock_fd,
-            .events = linux.POLL.IN,
-            .revents = 0,
-        };
+        var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
 
-        var n = conn.read(self.read_buf.write()) catch |e| switch (e) {
-            error.ConnectionReset,
-            error.NetworkDown,
-            error.Unreachable,
-            error.Unexpected,
-            => |err| return err,
+        var n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
             error.WouldBlock => 0,
+            else => |e| return e,
         };
 
         if (n == 0) {
-            const poll_result: i32 = while (true) {
-                const timeout = self.timeout_remaining_ms(deadline) orelse return error.ReadTimeout;
-                const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
-                switch (linux.errno(poll_rc)) {
-                    .SUCCESS => break @intCast(poll_rc),
-                    .NOMEM => return error.OutOfMemory,
-                    .INTR => continue,
-                    else => |e| unexpected_syscall("poll", e),
-                }
+            const pollfds: *[1]linux.pollfd = &pollfd;
+            _ = syscall.poll(
+                self.io,
+                pollfds,
+                deadline,
+                &self.unexpected_errno,
+            ) catch |e| return switch (e) {
+                error.Timeout => error.ReadTimeout,
+                error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+                else => |e2| return e2,
             };
 
-            if (poll_result == 0) {
-                return error.ReadTimeout;
-            }
-
-            n = conn.read(self.read_buf.write()) catch |e| switch (e) {
-                error.ConnectionReset,
-                error.NetworkDown,
-                error.Unreachable,
-                error.Unexpected,
-                => |err| return err,
-                error.WouldBlock => unexpected_syscall("read", linux.E.AGAIN),
+            n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
+                error.Unexpected => |err| return err,
+                error.WouldBlock => syscall.errno_bug("read", linux.E.AGAIN),
+                else => |e| return e,
             };
         }
         self.read_buf.mark_written(n);
@@ -772,8 +661,6 @@ const WriteError = error{
     WriteTimeout,
     OutOfMemory,
     ConnectionReset,
-    NetworkDown,
-    Unreachable,
     Unexpected,
 };
 
@@ -786,24 +673,21 @@ fn write_drain(self: *Self, conn: *Listener.Connection, buf: []const u8) void {
 
 fn drain(self: *Self, conn: *Listener.Connection) void {
     const deadline = self.make_deadline(self.grace_period);
-    var pollfd = linux.pollfd{
-        .events = linux.POLL.IN,
-        .fd = conn.sock_fd,
-        .revents = 0,
-    };
+    var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
     var i: usize = 0;
     while (i < self.drain_buf.len) {
-        const timeout = self.timeout_remaining_ms(deadline) orelse return;
-        const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
-        const poll_result: i32 = switch (linux.errno(poll_rc)) {
-            .SUCCESS => @intCast(poll_rc),
-            .NOMEM => return,
-            .INTR => continue,
-            else => |e| unexpected_syscall("poll", e),
+        _ = syscall.poll(
+            self.io,
+            @as(*[1]linux.pollfd, &pollfd),
+            deadline,
+            &self.unexpected_errno,
+        ) catch |e| switch (e) {
+            error.Timeout, error.Unexpected => return,
+            error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+            error.OutOfMemory => log("OutOfMemory when draining request\n", .{}),
         };
-        if (poll_result == 0) return;
 
-        const n = conn.read(self.drain_buf[i..]) catch return;
+        const n = conn.read(self.drain_buf[i..], &self.unexpected_errno) catch return;
         if (n == 0) return;
         i += n;
     }
@@ -824,46 +708,17 @@ fn write_all_poll(
     buf: []const u8,
     deadline: Io.Clock.Timestamp,
 ) WriteError!void {
-    var pollfd = linux.pollfd{
-        .fd = conn.sock_fd,
-        .events = linux.POLL.OUT,
-        .revents = 0,
+    syscall.send_all_poll(
+        conn.sock_fd,
+        buf,
+        deadline,
+        self.io,
+        &self.unexpected_errno,
+    ) catch |e| switch (e) {
+        error.Timeout => return error.WriteTimeout,
+        error.ConnectionReset, error.OutOfMemory, error.Unexpected => |e| return e,
+        else => |e| syscall.zerrno_bug("send | poll", e),
     };
-
-    var i: usize = conn.write(buf) catch |e| switch (e) {
-        error.WouldBlock => 0,
-        error.ConnectionReset,
-        error.NetworkDown,
-        error.Unreachable,
-        error.Unexpected,
-        => |err| return err,
-    };
-
-    while (i < buf.len) {
-        const poll_result: i32 = while (true) {
-            const timeout = self.timeout_remaining_ms(deadline) orelse return error.WriteTimeout;
-            const poll_rc = linux.poll(@as(*[1]linux.pollfd, &pollfd), 1, timeout);
-            switch (linux.errno(poll_rc)) {
-                .SUCCESS => break @intCast(poll_rc),
-                .NOMEM => return error.OutOfMemory,
-                .INTR => continue,
-                else => |e| unexpected_syscall("poll", e),
-            }
-        };
-        if (poll_result == 0) {
-            return error.WriteTimeout;
-        }
-
-        const n = conn.write(buf[i..]) catch |e| switch (e) {
-            error.WouldBlock => unexpected_syscall("write", linux.E.AGAIN),
-            error.ConnectionReset,
-            error.NetworkDown,
-            error.Unreachable,
-            error.Unexpected,
-            => |err| return err,
-        };
-        i += n;
-    }
 }
 
 fn local_addr(self: Self, addr: *linux.sockaddr.in) Listener.AddrError!void {
@@ -895,14 +750,6 @@ fn alloc_size(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, s
     return .{ .size = read_buf + req_drain_buf, .split = read_buf };
 }
 
-fn unexpected_syscall(syscall_name: []const u8, e: linux.E) noreturn {
-    debug.panic("unexpected error on {s} call: {}\n", .{ syscall_name, e });
-}
-
-fn log_syscall_err(syscall_name: []const u8, e: linux.E) void {
-    debug.print("unexpected error on {s} call: {}\n", .{ syscall_name, e });
-}
-
 /// Expects a non-negative duration. Fails if duration is too long.
 fn to_timeval(duration: Io.Duration) ?linux.timeval {
     assert(duration.nanoseconds >= 0);
@@ -922,149 +769,16 @@ fn now(self: Self) Io.Clock.Timestamp {
     return Io.Clock.Timestamp.now(self.io, Clock);
 }
 
+fn log(comptime fmt: []const u8, args: anytype) void {
+    debug.print(fmt, args);
+}
+
+fn log_err(msg: []const u8, e: anytype) void {
+    debug.print("{s}: {t}\n", .{ msg, e });
+}
+
 test {
     testing.refAllDecls(@This());
-}
-
-test "octet parser" {
-    const addr_u, const port_u = Listener.parse_addr("192.168.1.1:8080") orelse .{ 0, 0 };
-    switch (builtin.target.cpu.arch.endian()) {
-        .big => {
-            try testing.expectEqual(0xc0a80101, addr_u);
-            try testing.expectEqual(0x1f90, port_u);
-        },
-        .little => {
-            try testing.expectEqual(0x0101a8c0, addr_u);
-            try testing.expectEqual(0x901f, port_u);
-        },
-    }
-}
-
-test "fuzz the address parse function" {
-    try testing.fuzz({}, fuzz_addr_parse_function, .{});
-}
-
-fn fuzz_addr_parse_function(context: void, smith: *testing.Smith) !void {
-    _ = context;
-    var addr_buf: [40]u8 = undefined;
-
-    while (!smith.eos()) {
-        const addr = gen_str_addr(smith, &addr_buf);
-        const full_addr = gen_full_addr(smith, &addr_buf, addr.len);
-
-        const result = Listener.parse_addr(full_addr);
-        const resok = if (result) |_| true else false;
-
-        const sep_ix = std.mem.findScalar(u8, full_addr, ':');
-        const is_correct_sep = sep_ix != null;
-
-        const port_slice = if (sep_ix) |i| full_addr[i + 1 ..] else null;
-
-        const port_has_no_leading_zero = if (sep_ix) |i|
-            full_addr.len < i + 3 or full_addr[i + 1] != '0'
-        else
-            true;
-
-        const port_parse_is_ok = if (port_slice) |s|
-            if (std.fmt.parseUnsigned(u16, s, 10)) |_| true else |_| false
-        else
-            false;
-
-        const port_is_ascii = if (port_slice) |s| for (s) |c| {
-            if (c < '0' or c > '9') break false;
-        } else blk: {
-            break :blk true;
-        } else false;
-
-        const has_port = if (port_slice) |s| s.len > 0 else false;
-
-        const std_addr = if (sep_ix) |i| full_addr[0..i] else full_addr;
-
-        const std_result = Io.net.Ip4Address.parse(std_addr, 0);
-
-        const stdok = if (std_result) |_| true else |_| false;
-
-        errdefer debug.print(
-            \\
-            \\Address: |{s}|,
-            \\Address s: |{x}|,
-            \\
-            \\stdok: {},
-            \\is_correct_sep: {},
-            \\port_is_ascii: {},
-            \\port_has_no_leading_zero: {},
-            \\post_parse_is_ok: {},
-            \\has_port: {},
-            \\
-            \\resok: {},
-            \\
-        ,
-            .{
-                full_addr,
-                full_addr,
-                stdok,
-                is_correct_sep,
-                port_is_ascii,
-                port_has_no_leading_zero,
-                port_parse_is_ok,
-                has_port,
-                resok,
-            },
-        );
-
-        try testing.expectEqual(
-            stdok and is_correct_sep and port_is_ascii and port_has_no_leading_zero and port_parse_is_ok and has_port,
-            resok,
-        );
-        if (std_result) |stdres| {
-            if (result) |res| {
-                const stdresu32addr = std.mem.readInt(u32, &stdres.bytes, .big);
-                try testing.expectEqual(@byteSwap(stdresu32addr), res[0]);
-            }
-        } else |_| {}
-    }
-}
-
-fn gen_full_addr(s: *testing.Smith, addr_buf: *[40]u8, addr_len: usize) []u8 {
-    addr_buf[addr_len] = s.valueWeighted(u8, &[_]testing.Smith.Weight{
-        .rangeLessThan(u8, 0, ':', 1),
-        .value(u8, ':', 254 * 9),
-        .rangeAtMost(u8, ':' + 1, 255, 1),
-    });
-    const port_buf = addr_buf[addr_len + 1 .. addr_len + 1 + 6];
-    const port_len = s.sliceWeightedBytes(port_buf, &[_]testing.Smith.Weight{
-        .rangeLessThan(u8, 0, '9', 1),
-        .rangeAtMost(u8, '0', '9', 72),
-        .rangeAtMost(u8, '9' + 1, 255, 1),
-    });
-    return addr_buf[0 .. addr_len + 1 + port_len];
-}
-
-fn gen_str_addr(s: *testing.Smith, addr_buf: *[40]u8) []u8 {
-    const n_octets = s.valueRangeAtMost(u32, 0, 5);
-    var addr_index: usize = 0;
-    for (0..n_octets) |i| {
-        if (i != 0) {
-            addr_buf[addr_index] = s.valueWeighted(u8, &[_]testing.Smith.Weight{
-                .rangeLessThan(u8, 0, '.', 1),
-                .value(u8, '.', 254 * 9),
-                .rangeAtMost(u8, '.' + 1, 255, 1),
-            });
-            addr_index += 1;
-        }
-        const byte_len = gen_str_byte(s, addr_buf[addr_index .. addr_index + 5]);
-        addr_index += byte_len;
-    }
-
-    return addr_buf[0..addr_index];
-}
-
-fn gen_str_byte(s: *testing.Smith, buf: []u8) usize {
-    return s.sliceWeightedBytes(buf, &[_]testing.Smith.Weight{
-        .rangeLessThan(u8, 0, '0', 1),
-        .rangeAtMost(u8, '0', '9', 254 * 9),
-        .rangeAtMost(u8, '9' + 1, 255, 1),
-    });
 }
 
 test "bind to a connection and read happy" {
@@ -1080,7 +794,7 @@ test "bind to a connection and read happy" {
 
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(protocol.encode.ResponseCode.NotFound), 0, 0, 0, 0 },
+        &[_]u8{ @intFromEnum(protocol.ResponseCode.NotFound), 0, 0, 0, 0 },
         &response_buf,
     );
 
@@ -1102,7 +816,7 @@ test "slow writing client gets read timeout" {
     try r.interface.readSliceAll(&response);
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(protocol.encode.ResponseCode.Timeout), 0, 0, 0, 0 },
+        &[_]u8{ @intFromEnum(protocol.ResponseCode.Timeout), 0, 0, 0, 0 },
         &response,
     );
     try testing.expectError(error.ReadTimeout, t.close());
@@ -1125,7 +839,7 @@ test "slow reading client gets write timeout" {
     var r = t.client_reader();
     try r.interface.readSliceAll(&response);
     try testing.io.sleep(.fromMilliseconds(400), .awake);
-    try testing.expectError(error.ConnectionUnusable, t.close());
+    try testing.expectError(error.WriteTimeout, t.close());
     try testing.expectEqual(Action.Write, t.diag.action);
     try testing.expectEqual(error.WriteTimeout, t.diag.details);
 }
