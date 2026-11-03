@@ -111,7 +111,7 @@ const Request = struct {
         self: *Request,
         io: Io,
         random: Random,
-    ) error{Canceled}!void {
+    ) error{ Canceled, Timeout }!void {
         self.backoff_attempts += 1;
         try protocol.exponential_backoff_with_jitter(
             io,
@@ -119,6 +119,7 @@ const Request = struct {
             self.backoff_attempts,
             retry_connect_delay,
             retry_connect_delay_cap,
+            self.deadline,
         );
     }
 };

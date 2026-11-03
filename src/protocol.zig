@@ -15,6 +15,7 @@ const panic = debug.panic;
 const assert = debug.assert;
 const Random = std.Random;
 const Io = std.Io;
+const Clock = Io.Clock;
 
 pub const max_key_size = 64 * 1024;
 pub const max_value_size = 16 * 1024 * 1024;
@@ -301,7 +302,8 @@ pub fn exponential_backoff_with_jitter(
     attempt: i32,
     base: Duration,
     cap: Duration,
-) error{Canceled}!void {
+    deadline: Clock.Timestamp,
+) error{ Canceled, Timeout }!void {
     const backoff = calculate_exponential_backoff(attempt, base, cap);
     const with_jitter = random.intRangeAtMost(
         i96,
@@ -309,6 +311,11 @@ pub fn exponential_backoff_with_jitter(
         backoff.nanoseconds,
     );
     const dur: Duration = .{ .nanoseconds = with_jitter };
+
+    if (deadline.durationFromNow(io).raw.nanoseconds < dur.nanoseconds) {
+        return error.Timeout;
+    }
+
     try io.sleep(dur, .awake);
 }
 
