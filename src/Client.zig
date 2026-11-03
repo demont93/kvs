@@ -16,6 +16,7 @@ const Ip4Address = net.Ip4Address;
 const IpAddress = net.IpAddress;
 const Writer = Io.Writer;
 const Reader = Io.Reader;
+const Random = std.Random;
 
 const protocol = @import("protocol.zig");
 const syscall = @import("syscall.zig");
@@ -23,8 +24,10 @@ const syscall = @import("syscall.zig");
 const Self = @This();
 
 const retry_connect_delay: Duration = .fromMilliseconds(100);
+const retry_connect_delay_cap: Duration = .fromMilliseconds(500);
 
 io: Io,
+prng: Random.IoSource,
 addr: linux.sockaddr.in,
 sock_fd: i32,
 timeout: Duration,
@@ -46,6 +49,7 @@ const Request = struct {
     conn_state: ConnState,
     attempts: i32,
     max_attempts: i32,
+    backoff_attempts: i32,
     deadline: Clock.Timestamp,
     err: RequestError,
 
@@ -54,6 +58,7 @@ const Request = struct {
             .deadline = deadline,
             .conn_state = .ok,
             .attempts = 0,
+            .backoff_attempts = 0,
             .max_attempts = max_attempts,
             .err = undefined,
             .op = op,
@@ -101,6 +106,21 @@ const Request = struct {
             return error.Timeout;
         }
     }
+
+    fn exponential_backoff_with_jitter(
+        self: *Request,
+        io: Io,
+        random: Random,
+    ) error{Canceled}!void {
+        self.backoff_attempts += 1;
+        try protocol.exponential_backoff_with_jitter(
+            io,
+            random,
+            self.backoff_attempts,
+            retry_connect_delay,
+            retry_connect_delay_cap,
+        );
+    }
 };
 
 pub const Response = struct {
@@ -125,6 +145,7 @@ pub fn init(
     opts: ClientOpts,
 ) error{InvalidAddress}!void {
     self.io = io;
+    self.prng = Random.IoSource{ .io = self.io };
     self.last_request = undefined;
     self.addr = syscall.parse_addr(addr) orelse return error.InvalidAddress;
     self.sock_fd = -1;
@@ -195,7 +216,7 @@ fn do_request(
         const connect_result = switch (req.conn_state) {
             .ok => if (self.sock_fd == -1) self.connect(&req),
             .conn_failed => blk: {
-                self.io.sleep(retry_connect_delay, .awake) catch |e| {
+                req.exponential_backoff_with_jitter(self.io, self.prng.interface()) catch |e| {
                     req.set(.fatal, e);
                     continue;
                 };
