@@ -15,6 +15,13 @@ pub const Op = enum(u8) {
     get = 0,
     set = 1,
     del = 2,
+
+    pub fn is_read_only(self: Op) bool {
+        return switch (self) {
+            .get => true,
+            .set, .del => false,
+        };
+    }
 };
 
 pub const Request = struct {
@@ -224,6 +231,8 @@ pub const encode = struct {
         return msg;
     }
 
+    pub const KeyError = error{ KeyTooLarge, EmptyKey };
+
     pub fn check_key(key: []const u8) !void {
         if (key.len > max_key_size) {
             return error.KeyTooLarge;
@@ -232,6 +241,8 @@ pub const encode = struct {
             return error.EmptyKey;
         }
     }
+
+    pub const ValueError = error{ValueTooLarge};
 
     pub fn check_value(val: []const u8) !void {
         if (val.len > max_value_size) {
