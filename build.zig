@@ -165,7 +165,26 @@ pub fn build(b: *std.Build) void {
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
 
+    // Compile tests without running.
     const check_step = b.step("check", "Check compile");
     check_step.dependOn(&mod_tests.step);
     check_step.dependOn(&exe_tests.step);
+
+    // Profile server responses
+    const profile_response = b.addExecutable(.{
+        .name = "profile-response",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("prof/response/main.zig"),
+            .target = target,
+            .optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast }),
+            .omit_frame_pointer = false,
+            .imports = &.{
+                .{ .name = "kvs", .module = mod },
+            },
+        }),
+    });
+
+    const run_profile_response = b.addRunArtifact(profile_response);
+    const profile_response_step = b.step("profile-response", "Run profiling on server responses");
+    profile_response_step.dependOn(&run_profile_response.step);
 }
