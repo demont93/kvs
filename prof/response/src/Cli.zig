@@ -11,16 +11,22 @@ w_buf: [128]u8,
 w: Io.File.Writer,
 io: Io,
 
-pub const CommandSpec = union(enum) {
+const CommandSpec = union(enum) {
     run: struct {
         pub const port: FieldSpec(i16) = .{ .short = 'p' };
         pub const cpu1: FieldSpec(i32) = .{};
         pub const cpu2: FieldSpec(i32) = .{};
+
+        fn validate(cmd: anytype) !void {
+            if (cmd.cpu1 == cmd.cpu2) {
+                return error.SameCpu;
+            }
+        }
     },
     restore,
 };
 
-pub fn FieldSpec(T: type) type {
+fn FieldSpec(T: type) type {
     return struct {
         const Child = T;
         default: ?T = null,
@@ -109,10 +115,10 @@ fn FieldParser(FSpec: type, spec_ptr: *const FSpec) type {
                 .optional => {
                     if (self.value) |v| {
                         return v;
-                    } 
+                    }
                     if (spec.default) |v| {
                         return v;
-                    } 
+                    }
                     return null;
                 },
                 else => {
@@ -123,7 +129,7 @@ fn FieldParser(FSpec: type, spec_ptr: *const FSpec) type {
                         return d;
                     }
                     return error.MissingFlag;
-                }
+                },
             }
         }
     };
@@ -139,7 +145,7 @@ fn init(self: *Self, io: Io) void {
 }
 
 /// command flags args
-pub fn run(
+fn run(
     self: *Self,
     arena: *ArenaAllocator,
     args_iterator: *Args.Iterator,
@@ -178,12 +184,23 @@ fn output(command_parser: Command(.parser)) !Command(.output) {
 
                 flag.* = try flag_parser.result();
             }
+
+            const FlagsetSpec = @FieldType(CommandSpec, @tagName(tag));
+
+            if (@hasDecl(FlagsetSpec, "validate")) {
+                try FlagsetSpec.validate(flagset.*);
+            }
+
             return ret_val;
         },
     }
 }
 
-fn parseFlag(arena: *ArenaAllocator, command_parser: *Command(.parser), args: *Args.Iterator) !bool {
+fn parseFlag(
+    arena: *ArenaAllocator,
+    command_parser: *Command(.parser),
+    args: *Args.Iterator,
+) !bool {
     const key = args.next() orelse return false;
 
     if (key.len < 2 or key[0] != '-' or (key[1] != '-' and key.len != 2))
@@ -339,7 +356,7 @@ test "parse full command" {
     var it = args.iterate();
 
     const out = try cli.run(&arena, &it) orelse return error.Fail;
-    try testing.expectEqual(std.meta.Tag(Command(.out)).run, std.meta.activeTag(output));
+    try testing.expectEqual(std.meta.Tag(Command(.output)).run, std.meta.activeTag(out));
     try testing.expectEqual(2, out.run.cpu1);
     try testing.expectEqual(3432, out.run.port);
     try testing.expectEqual(3, out.run.cpu2);
