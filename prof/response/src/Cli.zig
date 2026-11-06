@@ -13,7 +13,7 @@ io: Io,
 
 const CommandSpec = union(enum) {
     run: struct {
-        pub const port: FieldSpec(i16) = .{ .short = 'p' };
+        pub const port: FieldSpec(u16) = .{ .short = 'p' };
         pub const cpu1: FieldSpec(i32) = .{};
         pub const cpu2: FieldSpec(i32) = .{};
 
@@ -263,7 +263,7 @@ fn parseValue(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
 fn parseScalar(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
     switch (T) {
         bool => return true,
-        i16, i32 => |U| {
+        u16, i16, i32 => |U| {
             const val = args.next() orelse return error.ExpectedValue;
             return try std.fmt.parseInt(U, val, 10);
         },
