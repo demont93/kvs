@@ -1,4 +1,5 @@
 const std = @import("std");
+const load_gen = @import("load_gen.zig");
 const Io = std.Io;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Args = std.process.Args;
@@ -11,11 +12,16 @@ w_buf: [128]u8,
 w: Io.File.Writer,
 io: Io,
 
+/// Accepts FieldSpec of enum, converting kebab case into snake case.
 const CommandSpec = union(enum) {
     run: struct {
         pub const port: FieldSpec(u16) = .{ .short = 'p' };
-        pub const cpu1: FieldSpec(i32) = .{};
-        pub const cpu2: FieldSpec(i32) = .{};
+        pub const cpu1: FieldSpec(i32) = .{ .short = '1' };
+        pub const cpu2: FieldSpec(i32) = .{ .short = '2' };
+        pub const requests: FieldSpec(u64) = .{ .short = 'r' };
+        pub const @"key-count": FieldSpec(u64) = .{ .short = 'k' };
+        pub const seed: FieldSpec(u64) = .{ .short = 's' };
+        pub const op: FieldSpec(load_gen.Op) = .{ .short = 'o' };
 
         fn validate(cmd: anytype) !void {
             if (cmd.cpu1 == cmd.cpu2) {
@@ -263,7 +269,7 @@ fn parseValue(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
 fn parseScalar(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
     switch (T) {
         bool => return true,
-        u16, i16, i32 => |U| {
+        u16, i16, i32, u64 => |U| {
             const val = args.next() orelse return error.ExpectedValue;
             return try std.fmt.parseInt(U, val, 10);
         },
@@ -271,7 +277,14 @@ fn parseScalar(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
             const val = args.next() orelse return error.ExpectedValue;
             return try arena.allocator().dupe(u8, val);
         },
-        else => @compileError("only bool, i32 and []u8 supported for flags"),
+        else => switch (@typeInfo(T)) {
+            .@"enum" => {
+                const str = args.next() orelse return error.ExpectedValue;
+                const clean = try std.mem.replaceOwned(u8, arena.allocator(), str, "-", "_");
+                return std.meta.stringToEnum(T, clean) orelse error.InvalidChoice;
+            },
+            else => @compileError("flag type not supported"),
+        },
     }
 }
 
@@ -296,11 +309,14 @@ fn printHelp(self: *Self) void {
         \\
         \\  Commands:
         \\
-        \\    - run --cpu1 <n> --cpu2 <n> --port <n>
-        \\        Sets up the environment and runs the profiling. 
-        \\
-        \\    - restore
-        \\        Restores initial state from the last saved state file.
+        \\    - run 
+        \\        -1, --cpu1      Core to pin the load generator to
+        \\        -2, --cpu2      Core to pin the server to
+        \\        -k, --key-count Amount of keys to preload kvs with
+        \\        -s, --seed      Seed for the prng
+        \\        -r, --requests  Amount of requests to send
+        \\        -o, --op        Operation: get-hit, get-miss, set-insert,
+        \\                          set-replace, delete-hit, delete-miss
         \\
     ,
         .{},
@@ -352,6 +368,14 @@ test "parse full command" {
         "3432",
         "--cpu2\x00",
         "3",
+        "-k",
+        "234",
+        "-s",
+        "234234",
+        "-r",
+        "1",
+        "-o",
+        "get-hit",
     } };
     var it = args.iterate();
 
@@ -360,4 +384,8 @@ test "parse full command" {
     try testing.expectEqual(2, out.run.cpu1);
     try testing.expectEqual(3432, out.run.port);
     try testing.expectEqual(3, out.run.cpu2);
+    try testing.expectEqual(234, out.run.@"key-count");
+    try testing.expectEqual(234234, out.run.seed);
+    try testing.expectEqual(1, out.run.requests);
+    try testing.expectEqual(load_gen.Op.get_hit, out.run.op);
 }
