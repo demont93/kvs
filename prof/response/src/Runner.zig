@@ -9,6 +9,14 @@ const srv = @import("srv.zig");
 const ServerHandle = struct {
     pid: i32,
     sock: i32,
+
+    fn wait(self: *ServerHandle) !u8 {
+        return waitHandle(&self.pid, &self.sock);
+    }
+
+    fn kill(self: *ServerHandle) void {
+        return killHandle(&self.pid, &self.sock);
+    }
 };
 
 const LoadGenHandle = struct {
@@ -36,23 +44,11 @@ const LoadGenHandle = struct {
     }
 
     fn wait(self: *LoadGenHandle) !u8 {
-        const close_result = closeFd(self.fd);
-        self.sock = -1;
-        const code = waitChild(self.pid);
-        self.pid = std.math.minInt(i32);
-
-        if (close_result) |_| {
-            return code;
-        } else |e| {
-            return e;
-        }
+        return waitHandle(&self.pid, &self.sock);
     }
 
     fn kill(self: *LoadGenHandle) void {
-        killChild(self.pid);
-        self.pid = std.math.minInt(i32);
-        closeFdLog(self.sock);
-        self.sock = -1;
+        return killHandle(&self.pid, &self.sock);
     }
 };
 
@@ -196,6 +192,26 @@ fn socketPair() error{Unexpected}![2]i32 {
     };
 
     return socks;
+}
+
+fn waitHandle(pid: *i32, sock_fd: *i32) !u8 {
+    const close_result = closeFd(sock_fd.*);
+    sock_fd.* = -1;
+    const code = waitChild(pid.*);
+    pid.* = std.math.minInt(i32);
+
+    if (close_result) |_| {
+        return code;
+    } else |e| {
+        return e;
+    }
+}
+
+fn killHandle(pid: *i32, sock_fd: *i32) void {
+    killChild(pid.*);
+    pid.* = std.math.minInt(i32);
+    closeFdLog(sock_fd.*);
+    sock_fd.* = -1;
 }
 
 fn waitChild(pid: i32) u8 {
