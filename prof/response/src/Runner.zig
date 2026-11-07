@@ -5,24 +5,48 @@ const errno = linux.errno;
 
 const load_gen = @import("load_gen.zig");
 
-// pub fn run(cpu1: i32, cpu2: i32, port: u16) !void {}
+const LoadGenHandle = struct {
+    pid: i32,
+    sock: i32,
+};
 
-fn openLoadGen() !i32 {
+pub fn run(cmd: anytype) !void {
+    const load_gen_handle = openLoadGen(cmd);
+    _ = load_gen_handle;
+    @panic("unimplemented");
+}
+
+fn openLoadGen(cmd: anytype) error{Unexpected}!LoadGenHandle {
     var socks: [2]i32 = undefined;
-    const sp_rc = linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks);
-    switch (errno(sp_rc)) {
+    try switch (errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks))) {
         .SUCCESS => {},
         .OPNOTSUPP,
         .PROTONOSUPPORT,
         .AFNOSUPPORT,
         => |e| errnoBug("socketpair", e),
-        else => |e| return errnoUnexpected("socketpair", e),
-    }
-    errdefer {
-        linux.close(socks[0]);
-        linux.close(socks[1]);
-    }
+        else => |e| errnoUnexpected("socketpair", e),
+    };
 
+    const pid_result = openLoadGenMakeStack(cmd);
+
+    const close_result = switch (errno(linux.close(socks[0]))) {
+        .SUCCESS => {},
+        else => |e| errnoUnexpected("close", e),
+    };
+
+    if (pid_result) |pid| {
+        if (close_result) |_| {
+            return LoadGenHandle{ .sock = socks[1], .pid = pid };
+        } else |_| {}
+        reapChild(pid);
+    } else |_| {}
+
+    _ = linux.close(socks[1]);
+    try pid_result;
+    try close_result;
+}
+
+fn openLoadGenMakeStack(cmd: anytype) error{Unexpected}!i32 {
     const mmap_rc = linux.mmap(
         null,
         1 << 20,
@@ -31,9 +55,9 @@ fn openLoadGen() !i32 {
         -1,
         0,
     );
-    const child_stack: [*]u8 = switch (errno(mmap_rc)) {
-        .SUCCESS => @ptrFromInt(mmap_rc),
-        .NOMEM => return error.OutOfMemory,
+    const child_stack = try switch (errno(mmap_rc)) {
+        .SUCCESS => @as([*]u8, @ptrFromInt(mmap_rc)),
+        .NOMEM => error.OutOfMemory,
         .AGAIN,
         .BADF,
         .EXIST,
@@ -44,19 +68,34 @@ fn openLoadGen() !i32 {
         .PERM,
         .TXTBSY,
         => |e| errnoBug("mmap", e),
-        else => |e| return errnoUnexpected("mmap", e),
+        else => |e| errnoUnexpected("mmap", e),
     };
 
-    defer switch (errno(linux.munmap(child_stack, 1 << 20))) {
+    const result = openLoadGenMakeStackClone(cmd, child_stack);
+
+    switch (errno(linux.munmap(child_stack, 1 << 20))) {
         .SUCCESS => {},
         else => |e| errnoBug("munmap", e),
-    };
+    }
 
+    return result;
+}
+
+fn openLoadGenMakeStackClone(cmd: anytype, stack: [*]u8) error{Unexpected}!i32 {
+    const load_gen_ctx: load_gen.Context = .{
+        .cpu = cmd.cpu2,
+        .workload = .{
+            .key_count = cmd.@"key-count",
+            .operation = cmd.op,
+            .requests = cmd.requests,
+            .seed = cmd.seed,
+        },
+    };
     const clone_rc = linux.clone(
         &load_gen.loadGen,
-        @intFromPtr(child_stack) + (1 << 20),
+        @intFromPtr(stack) + (1 << 20),
         linux.SIG.CHLD,
-        0,
+        @intFromPtr(&load_gen_ctx),
         null,
         0,
         null,
@@ -64,7 +103,7 @@ fn openLoadGen() !i32 {
 
     return switch (errno(clone_rc)) {
         .SUCCESS => @intCast(clone_rc),
-        else => |e| return errnoUnexpected("clone", e),
+        else => |e| errnoUnexpected("clone", e),
     };
 }
 
@@ -87,6 +126,18 @@ fn setCpuset(set: *linux.cpu_set_t, n: i32) !void {
     const one: Elem = 1;
     const mask = one << pos;
     set[index] |= mask;
+}
+
+fn reapChild(pid: i32) void {
+    switch (errno(linux.kill(pid, linux.SIG.KILL))) {
+        .SUCCESS, .SRCH => {},
+        else => |e| errnoBug("kill", e),
+    }
+    var status: u32 = undefined;
+    switch (errno(linux.waitpid(pid, &status, 0))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("waitpid", e),
+    }
 }
 
 fn errnoBug(call: []const u8, e: linux.E) noreturn {

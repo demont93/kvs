@@ -3,17 +3,12 @@ const linux = std.os.linux;
 
 const Self = @This();
 
-pub fn loadGen(arg: *Context) callconv(.c) u8 {
-    _ = arg;
-    @panic("unimplemented");
-}
-
-const Context = struct {
+pub const Context = struct {
     workload: Workload,
     cpu: linux.cpu_set_t,
 };
 
-const Workload = struct {
+pub const Workload = struct {
     operation: Op,
     requests: usize,
     key_count: usize,
@@ -28,3 +23,8 @@ pub const Op = enum {
     delete_hit,
     delete_miss,
 };
+
+pub fn loadGen(arg: *Context) callconv(.c) u8 {
+    _ = arg;
+    @panic("unimplemented");
+}
