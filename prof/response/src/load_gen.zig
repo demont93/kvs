@@ -24,6 +24,13 @@ pub const Op = enum {
     delete_miss,
 };
 
+pub const Message = enum(u8) {
+    ready = 0,
+    done = 1,
+    start = 2,
+    err = 3,
+};
+
 pub fn loadGen(arg: *Context) callconv(.c) u8 {
     _ = arg;
     @panic("unimplemented");

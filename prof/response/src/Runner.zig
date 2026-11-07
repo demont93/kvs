@@ -9,6 +9,26 @@ const LoadGenHandle = struct {
     pid: i32,
     sock: i32,
 
+    /// Messages the Load Generator to start the measure phase. Should be sent after attaching
+    /// profiler and other tooling and receiving ready from the load generator, indicating all
+    /// setup was performed.
+    fn start(self: *LoadGenHandle) !void {
+        const msg = @intFromEnum(load_gen.Message.start);
+        const write_rc = linux.write(self.fd, @ptrCast(&msg), 1);
+        while (true) {
+            const n: i32 = switch (errno()) {
+                .SUCCESS => @intCast(write_rc),
+                .INTR => continue,
+                .INVAL,
+                .BADF,
+                => |e| errnoBug("write", e),
+                .CONNRESET, .PIPE => return error.ConnectionReset,
+                else => |e| return errnoUnexpected("write", e),
+            };
+            if (n == 1) break;
+        }
+    }
+
     fn waitClose(self: *LoadGenHandle) !u8 {
         const close_result = switch (errno(linux.close(self.sock))) {
             .SUCCESS => {},
