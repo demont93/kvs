@@ -14,16 +14,17 @@ const Context = struct {
 };
 
 const Workload = struct {
-    operation: enum {
-        get_hit,
-        get_miss,
-        set_insert,
-        set_replace,
-        delete_hit,
-        delete_miss,
-    },
+    operation: Op,
     requests: usize,
     key_count: usize,
-    value_size: usize,
     seed: u64,
+};
+
+pub const Op = enum {
+    get_hit,
+    get_miss,
+    set_insert,
+    set_replace,
+    delete_hit,
+    delete_miss,
 };
