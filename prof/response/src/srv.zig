@@ -4,6 +4,7 @@ const Alignment = std.mem.Alignment;
 const SmpAllocator = std.heap.SmpAllocator;
 const Io = std.Io;
 const assert = std.debug.assert;
+const linux = std.os.linux;
 
 const CountAllocator = struct {
     smp_alloc: SmpAllocator = .{},
@@ -81,3 +82,12 @@ const CountAllocator = struct {
         return res;
     }
 };
+
+pub const Context = struct {
+    cpu: linux.cpu_set_t,
+};
+
+pub fn processMain(ctx: *const Context) callconv(.c) u8 {
+    _ = ctx;
+    @panic("unimplemented");
+}

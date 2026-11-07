@@ -31,7 +31,7 @@ pub const Message = enum(u8) {
     err = 3,
 };
 
-pub fn loadGen(arg: *Context) callconv(.c) u8 {
+pub fn processMain(arg: *Context) callconv(.c) u8 {
     _ = arg;
     @panic("unimplemented");
 }

@@ -4,6 +4,12 @@ const testing = std.testing;
 const errno = linux.errno;
 
 const load_gen = @import("load_gen.zig");
+const srv = @import("srv.zig");
+
+const ServerHandle = struct {
+    pid: i32,
+    sock: i32,
+};
 
 const LoadGenHandle = struct {
     pid: i32,
@@ -29,11 +35,8 @@ const LoadGenHandle = struct {
         }
     }
 
-    fn waitClose(self: *LoadGenHandle) !u8 {
-        const close_result = switch (errno(linux.close(self.sock))) {
-            .SUCCESS => {},
-            else => |e| errnoUnexpected("close", e),
-        };
+    fn wait(self: *LoadGenHandle) !u8 {
+        const close_result = closeFd(self.fd);
         self.sock = -1;
         const code = waitChild(self.pid);
         self.pid = std.math.minInt(i32);
@@ -48,51 +51,94 @@ const LoadGenHandle = struct {
     fn kill(self: *LoadGenHandle) void {
         killChild(self.pid);
         self.pid = std.math.minInt(i32);
-        switch (errno(linux.close(self.sock))) {
-            .SUCCESS => {},
-            else => |e| _ = errnoUnexpected("close", e),
-        }
+        closeFdLog(self.sock);
         self.sock = -1;
     }
 };
 
 pub fn run(cmd: anytype) !void {
-    const load_gen_handle = try openLoadGen(cmd);
-    _ = load_gen_handle;
+    const lg_ctx: load_gen.Context = .{
+        .cpu = cmd.cpu2,
+        .workload = .{
+            .key_count = cmd.@"key-count",
+            .operation = cmd.op,
+            .requests = cmd.requests,
+            .seed = cmd.seed,
+        },
+    };
+
+    const lg_handle = try openLoadGen(lg_ctx);
+
+    const server_ctx: srv.Context = .{
+        .cpu = cmd.cpu1,
+    };
+
+    const server_handle = openServer(server_ctx) catch |e| {
+        lg_handle.kill();
+        return e;
+    };
+
+    _ = server_handle;
     @panic("unimplemented");
 }
 
-fn openLoadGen(cmd: anytype) error{Unexpected}!LoadGenHandle {
-    var socks: [2]i32 = undefined;
-    try switch (errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks))) {
-        .SUCCESS => {},
-        .OPNOTSUPP,
-        .PROTONOSUPPORT,
-        .AFNOSUPPORT,
-        => |e| errnoBug("socketpair", e),
-        else => |e| errnoUnexpected("socketpair", e),
+fn openServer(ctx: srv.Context) error{Unexpected}!ServerHandle {
+    const socks = try socketPair();
+
+    const pid = clone(&ctx, srv.processMain) catch |e| {
+        closeFdLog(socks[0]);
+        closeFdLog(socks[1]);
+        return e;
     };
 
-    const pid_result = openLoadGenMakeStack(cmd);
-
-    const close_result = switch (errno(linux.close(socks[0]))) {
-        .SUCCESS => {},
-        else => |e| errnoUnexpected("close", e),
-    };
-
-    if (pid_result) |pid| {
-        if (close_result) |_| {
-            return LoadGenHandle{ .sock = socks[1], .pid = pid };
-        } else |_| {}
+    closeFd(socks[0]) catch |e| {
+        closeFdLog(socks[0]);
         killChild(pid);
-    } else |_| {}
+        return e;
+    };
 
-    _ = linux.close(socks[1]);
-    try pid_result;
-    try close_result;
+    return ServerHandle{ .pid = pid, .sock = socks[1] };
 }
 
-fn openLoadGenMakeStack(cmd: anytype) error{Unexpected}!i32 {
+fn openLoadGen(ctx: load_gen.Context) error{Unexpected}!LoadGenHandle {
+    const socks = try socketPair();
+
+    const pid = clone(ctx, &load_gen.processMain) catch |e| {
+        closeFdLog(socks[0]);
+        closeFdLog(socks[1]);
+        return e;
+    };
+
+    closeFd(socks[0]) catch |e| {
+        closeFdLog(socks[1]);
+        killChild(pid);
+        return e;
+    };
+
+    return LoadGenHandle{ .sock = socks[1], .pid = pid };
+}
+
+fn clone(arg: *anyopaque, f: *const fn (*anyopaque) callconv(.c) u8) !i32 {
+    const stack = try makeStack();
+    defer destroyStack(stack);
+
+    const clone_rc = linux.clone(
+        f,
+        @intFromPtr(stack) + stack.len,
+        linux.SIG.CHLD,
+        @intFromPtr(arg),
+        null,
+        0,
+        null,
+    );
+
+    return switch (errno(clone_rc)) {
+        .SUCCESS => @intCast(clone_rc),
+        else => |e| errnoUnexpected("clone", e),
+    };
+}
+
+fn makeStack() ![]u8 {
     const mmap_rc = linux.mmap(
         null,
         1 << 20,
@@ -101,7 +147,8 @@ fn openLoadGenMakeStack(cmd: anytype) error{Unexpected}!i32 {
         -1,
         0,
     );
-    const child_stack = try switch (errno(mmap_rc)) {
+
+    return switch (errno(mmap_rc)) {
         .SUCCESS => @as([*]u8, @ptrFromInt(mmap_rc)),
         .NOMEM => error.OutOfMemory,
         .AGAIN,
@@ -116,41 +163,82 @@ fn openLoadGenMakeStack(cmd: anytype) error{Unexpected}!i32 {
         => |e| errnoBug("mmap", e),
         else => |e| errnoUnexpected("mmap", e),
     };
+}
 
-    const result = openLoadGenMakeStackClone(cmd, child_stack);
-
-    switch (errno(linux.munmap(child_stack, 1 << 20))) {
+fn destroyStack(stack: []u8) void {
+    switch (errno(linux.munmap(stack, 1 << 20))) {
         .SUCCESS => {},
         else => |e| errnoBug("munmap", e),
     }
-
-    return result;
 }
 
-fn openLoadGenMakeStackClone(cmd: anytype, stack: [*]u8) error{Unexpected}!i32 {
-    const load_gen_ctx: load_gen.Context = .{
-        .cpu = cmd.cpu2,
-        .workload = .{
-            .key_count = cmd.@"key-count",
-            .operation = cmd.op,
-            .requests = cmd.requests,
-            .seed = cmd.seed,
-        },
+fn closeFd(fd: i32) !void {
+    return switch (errno(linux.close(fd))) {
+        .SUCCESS => {},
+        else => |e| errnoUnexpected("close", e),
     };
-    const clone_rc = linux.clone(
-        &load_gen.loadGen,
-        @intFromPtr(stack) + (1 << 20),
-        linux.SIG.CHLD,
-        @intFromPtr(&load_gen_ctx),
-        null,
-        0,
-        null,
-    );
+}
 
-    return switch (errno(clone_rc)) {
-        .SUCCESS => @intCast(clone_rc),
-        else => |e| errnoUnexpected("clone", e),
+fn closeFdLog(fd: i32) void {
+    closeFd(fd) catch {};
+}
+
+fn socketPair() error{Unexpected}![2]i32 {
+    var socks: [2]i32 = undefined;
+
+    try switch (errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks))) {
+        .SUCCESS => {},
+        .OPNOTSUPP,
+        .PROTONOSUPPORT,
+        .AFNOSUPPORT,
+        => |e| errnoBug("socketpair", e),
+        else => |e| errnoUnexpected("socketpair", e),
     };
+
+    return socks;
+}
+
+fn waitChild(pid: i32) u8 {
+    var status: u32 = undefined;
+
+    switch (errno(linux.waitpid(pid, &status, 0))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("waitpid", e),
+    }
+
+    if (linux.W.IFEXITED(status)) {
+        return linux.W.EXITSTATUS(status);
+    } else {
+        var exit_str: []const u8 = undefined;
+        var cause: []const u8 = undefined;
+
+        if (linux.W.IFSIGNALED(status)) {
+            exit_str = "signaled";
+            cause = @tagName(linux.W.TERMSIG(status));
+        } else if (linux.W.IFSTOPPED(status)) {
+            exit_str = "stopped";
+            cause = @tagName(@as(linux.SIG, @enumFromInt(linux.W.STOPSIG(status))));
+        } else {
+            exit_str = "unknown";
+            cause = "unknown";
+        }
+
+        std.debug.panic("child {s} with {s}\n", .{ exit_str, cause });
+    }
+}
+
+fn killChild(pid: i32) void {
+    switch (errno(linux.kill(pid, linux.SIG.KILL))) {
+        .SUCCESS, .SRCH => {},
+        else => |e| errnoBug("kill", e),
+    }
+
+    var status: u32 = undefined;
+
+    switch (errno(linux.waitpid(pid, &status, 0))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("waitpid", e),
+    }
 }
 
 fn cpuNSet(n: i32) !linux.cpu_set_t {
@@ -172,43 +260,6 @@ fn setCpuset(set: *linux.cpu_set_t, n: i32) !void {
     const one: Elem = 1;
     const mask = one << pos;
     set[index] |= mask;
-}
-
-fn waitChild(pid: i32) u8 {
-    var status: u32 = undefined;
-    switch (errno(linux.waitpid(pid, &status, 0))) {
-        .SUCCESS => {},
-        else => |e| errnoBug("waitpid", e),
-    }
-    if (linux.W.IFEXITED(status)) {
-        return linux.W.EXITSTATUS(status);
-    } else {
-        var exit_str: []const u8 = undefined;
-        var cause: []const u8 = undefined;
-        if (linux.W.IFSIGNALED(status)) {
-            exit_str = "signaled";
-            cause = @tagName(linux.W.TERMSIG(status));
-        } else if (linux.W.IFSTOPPED(status)) {
-            exit_str = "stopped";
-            cause = @tagName(@as(linux.SIG, @enumFromInt(linux.W.STOPSIG(status))));
-        } else {
-            exit_str = "unknown";
-            cause = "unknown";
-        }
-        std.debug.panic("child {s} with {s}\n", .{ exit_str, cause });
-    }
-}
-
-fn killChild(pid: i32) void {
-    switch (errno(linux.kill(pid, linux.SIG.KILL))) {
-        .SUCCESS, .SRCH => {},
-        else => |e| errnoBug("kill", e),
-    }
-    var status: u32 = undefined;
-    switch (errno(linux.waitpid(pid, &status, 0))) {
-        .SUCCESS => {},
-        else => |e| errnoBug("waitpid", e),
-    }
 }
 
 fn errnoBug(call: []const u8, e: linux.E) noreturn {
