@@ -8,10 +8,36 @@ const load_gen = @import("load_gen.zig");
 const LoadGenHandle = struct {
     pid: i32,
     sock: i32,
+
+    fn waitClose(self: *LoadGenHandle) !u8 {
+        const close_result = switch (errno(linux.close(self.sock))) {
+            .SUCCESS => {},
+            else => |e| errnoUnexpected("close", e),
+        };
+        self.sock = -1;
+        const code = waitChild(self.pid);
+        self.pid = std.math.minInt(i32);
+
+        if (close_result) |_| {
+            return code;
+        } else |e| {
+            return e;
+        }
+    }
+
+    fn kill(self: *LoadGenHandle) void {
+        killChild(self.pid);
+        self.pid = std.math.minInt(i32);
+        switch (errno(linux.close(self.sock))) {
+            .SUCCESS => {},
+            else => |e| _ = errnoUnexpected("close", e),
+        }
+        self.sock = -1;
+    }
 };
 
 pub fn run(cmd: anytype) !void {
-    const load_gen_handle = openLoadGen(cmd);
+    const load_gen_handle = try openLoadGen(cmd);
     _ = load_gen_handle;
     @panic("unimplemented");
 }
@@ -38,7 +64,7 @@ fn openLoadGen(cmd: anytype) error{Unexpected}!LoadGenHandle {
         if (close_result) |_| {
             return LoadGenHandle{ .sock = socks[1], .pid = pid };
         } else |_| {}
-        reapChild(pid);
+        killChild(pid);
     } else |_| {}
 
     _ = linux.close(socks[1]);
@@ -128,7 +154,32 @@ fn setCpuset(set: *linux.cpu_set_t, n: i32) !void {
     set[index] |= mask;
 }
 
-fn reapChild(pid: i32) void {
+fn waitChild(pid: i32) u8 {
+    var status: u32 = undefined;
+    switch (errno(linux.waitpid(pid, &status, 0))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("waitpid", e),
+    }
+    if (linux.W.IFEXITED(status)) {
+        return linux.W.EXITSTATUS(status);
+    } else {
+        var exit_str: []const u8 = undefined;
+        var cause: []const u8 = undefined;
+        if (linux.W.IFSIGNALED(status)) {
+            exit_str = "signaled";
+            cause = @tagName(linux.W.TERMSIG(status));
+        } else if (linux.W.IFSTOPPED(status)) {
+            exit_str = "stopped";
+            cause = @tagName(@as(linux.SIG, @enumFromInt(linux.W.STOPSIG(status))));
+        } else {
+            exit_str = "unknown";
+            cause = "unknown";
+        }
+        std.debug.panic("child {s} with {s}\n", .{ exit_str, cause });
+    }
+}
+
+fn killChild(pid: i32) void {
     switch (errno(linux.kill(pid, linux.SIG.KILL))) {
         .SUCCESS, .SRCH => {},
         else => |e| errnoBug("kill", e),
@@ -141,11 +192,11 @@ fn reapChild(pid: i32) void {
 }
 
 fn errnoBug(call: []const u8, e: linux.E) noreturn {
-    std.debug.panic("errno bug when calling {}: {t}", .{ call, e });
+    std.debug.panic("errno bug when calling {}: {t}\n", .{ call, e });
 }
 
 fn errnoUnexpected(call: []const u8, e: linux.E) error{Unexpected} {
-    std.debug.print("unexpected errno when calling {}: {t}", .{ call, e });
+    std.debug.print("unexpected errno when calling {}: {t}\n", .{ call, e });
 }
 
 test "setCpuset" {
