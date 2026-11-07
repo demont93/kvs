@@ -176,7 +176,7 @@ pub fn build(b: *std.Build) void {
         .root_module = b.createModule(.{
             .root_source_file = b.path("prof/response/src/main.zig"),
             .target = target,
-            .optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast }),
+            .optimize = .ReleaseFast,
             .omit_frame_pointer = false,
             .imports = &.{
                 .{ .name = "kvs", .module = mod },
@@ -184,7 +184,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const install_profile_response = b.addInstallArtifact(profile_response, .{});
+
     // const run_profile_response = b.addRunArtifact(profile_response);
     const profile_response_step = b.step("profile-response", "Run profiling on server responses");
     profile_response_step.dependOn(&profile_response.step);
+    profile_response_step.dependOn(&install_profile_response.step);
 }
