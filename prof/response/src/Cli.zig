@@ -145,13 +145,13 @@ fn FieldOutput(FSpec: type) type {
     return FSpec.Child;
 }
 
-fn init(self: *Self, io: Io) void {
+pub fn init(self: *Self, io: Io) void {
     self.io = io;
     self.w = .init(.stdout(), io, &self.w_buf);
 }
 
 /// command flags args
-fn run(
+pub fn run(
     self: *Self,
     arena: *ArenaAllocator,
     args_iterator: *Args.Iterator,
