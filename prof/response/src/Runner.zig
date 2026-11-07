@@ -2,9 +2,32 @@ const std = @import("std");
 const linux = std.os.linux;
 const testing = std.testing;
 const errno = linux.errno;
+const panic = std.debug.panic;
 
 const load_gen = @import("load_gen.zig");
 const srv = @import("srv.zig");
+
+const Runner = struct {
+    server_handle: ServerHandle,
+    lg_handle: LoadGenHandle,
+
+    fn init(
+        self: *Runner,
+        server_ctx: srv.Context,
+        lg_ctx: load_gen.Context,
+    ) error{Unexpected}!void {
+        self.lg_handle = try openLoadGen(lg_ctx);
+
+        self.server_handle = openServer(server_ctx) catch |e| {
+            self.lg_handle.kill();
+            return e;
+        };
+    }
+
+    fn run(self: *Runner) !void {
+        self.lg_handle.awaitReady();
+    }
+};
 
 const ServerHandle = struct {
     pid: i32,
@@ -23,22 +46,57 @@ const LoadGenHandle = struct {
     pid: i32,
     sock: i32,
 
+    fn awaitReady(self: *LoadGenHandle) !void {
+        var buf: [1]u8 = undefined;
+
+        while (true) {
+            const read_rc = linux.read(self.sock, &buf, 1);
+            switch (errno(read_rc)) {
+                .SUCCESS => if (read_rc == 0) return error.LGClosed else break,
+                .INTR => continue,
+                .PIPE, .CONNRESET => return error.LGClosed,
+                .AGAIN,
+                .BADF,
+                .FAULT,
+                .INVAL,
+                .ISDIR,
+                .NOTSOCK,
+                => |e| errnoBug("read", e),
+                else => |e| return errnoUnexpected("read", e),
+            }
+        }
+
+        const msg = std.enums.fromInt(load_gen.Message, buf[0]) orelse
+            panic("invalid message from load generator: {}\n", .{buf[0]});
+
+        switch (msg) {
+            .err => return error.LGError,
+            .ready => return,
+            .done, .start => return panic("invalid message from load generator: {t}", .{msg}),
+        }
+    }
+
     /// Messages the Load Generator to start the measure phase. Should be sent after attaching
     /// profiler and other tooling and receiving ready from the load generator, indicating all
     /// setup was performed.
     fn start(self: *LoadGenHandle) !void {
         const msg = @intFromEnum(load_gen.Message.start);
-        const write_rc = linux.write(self.fd, @ptrCast(&msg), 1);
+
         while (true) {
-            const n: i32 = switch (errno()) {
+            const write_rc = linux.write(self.fd, @ptrCast(&msg), 1);
+
+            const n: i32 = switch (errno(write_rc)) {
                 .SUCCESS => @intCast(write_rc),
                 .INTR => continue,
                 .INVAL,
+                .AGAIN,
                 .BADF,
+                .NOTSOCK,
                 => |e| errnoBug("write", e),
-                .CONNRESET, .PIPE => return error.ConnectionReset,
+                .CONNRESET, .PIPE => return error.ServerClosed,
                 else => |e| return errnoUnexpected("write", e),
             };
+
             if (n == 1) break;
         }
     }
@@ -53,6 +111,10 @@ const LoadGenHandle = struct {
 };
 
 pub fn run(cmd: anytype) !void {
+    const server_ctx: srv.Context = .{
+        .cpu = cmd.cpu1,
+    };
+
     const lg_ctx: load_gen.Context = .{
         .cpu = cmd.cpu2,
         .workload = .{
@@ -63,19 +125,8 @@ pub fn run(cmd: anytype) !void {
         },
     };
 
-    const lg_handle = try openLoadGen(lg_ctx);
-
-    const server_ctx: srv.Context = .{
-        .cpu = cmd.cpu1,
-    };
-
-    const server_handle = openServer(server_ctx) catch |e| {
-        lg_handle.kill();
-        return e;
-    };
-
-    _ = server_handle;
-    @panic("unimplemented");
+    var runner: Runner = undefined;
+    try runner.init(server_ctx, lg_ctx);
 }
 
 fn openServer(ctx: srv.Context) error{Unexpected}!ServerHandle {
