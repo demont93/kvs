@@ -3,6 +3,10 @@ const linux = std.os.linux;
 const testing = std.testing;
 const errno = linux.errno;
 const panic = std.debug.panic;
+const ArenaAllocator = std.heap.ArenaAllocator;
+const process = std.process;
+const Io = std.Io;
+const mem = std.mem;
 
 const load_gen = @import("load_gen.zig");
 const srv = @import("srv.zig");
@@ -24,8 +28,21 @@ const Runner = struct {
         };
     }
 
-    fn run(self: *Runner) !void {
-        self.lg_handle.awaitReady();
+    fn profile(self: *Runner, io: Io) !void {
+        try self.lg_handle.awaitReady();
+
+        const perf = Perf.record(io, self.server_handle.pid);
+
+        try perf.enable();
+        try self.lg_handle.start();
+        
+
+        // try self.lg_handle.awaitDone();
+    }
+
+    fn attachProfilingTools(self: Runner) !void {
+        _ = self;
+        @panic("unimplemented");
     }
 };
 
@@ -107,6 +124,181 @@ const LoadGenHandle = struct {
 
     fn kill(self: *LoadGenHandle) void {
         return killHandle(&self.pid, &self.sock);
+    }
+};
+
+const Perf = struct {
+    const ack = "ack\n";
+
+    child_proc: process.Child,
+    ack_pipe: i32,
+    ctl_pipe: i32,
+
+    const PipePairs = struct {
+        my_r: i32,
+        my_w: i32,
+        their_r: i32,
+        their_w: i32,
+
+        fn init() error{Unexpected}!PipePairs {
+            const pipes1 = try makePipe();
+            errdefer {
+                closeFdLog(pipes1[0]);
+                closeFdLog(pipes1[1]);
+            }
+            const pipes2 = try makePipe();
+
+            return .{
+                .my_r = pipes1[0],
+                .my_w = pipes1[1],
+                .their_r = pipes2[0],
+                .their_w = pipes2[1],
+            };
+        }
+
+        fn noCloExecTheirs(self: PipePairs) !void {
+            try noCloexec(self.their_r);
+            try noCloexec(self.their_w);
+        }
+
+        fn closeLogMine(self: *PipePairs) void {
+            closeFdLog(self.my_r);
+            closeFdLog(self.my_w);
+        }
+
+        fn closeTheirs(self: *PipePairs) !void {
+            const r1 = closeFd(self.their_r);
+            const r2 = closeFd(self.their_w);
+
+            try r1;
+            try r2;
+        }
+    };
+
+    fn wait(self: *Perf, io: Io) !void {
+        const e1 = closeFd(self.ack_pipe);
+        const e2 = closeFd(self.ctl_pipe);
+        _ = try self.child_proc.wait(io);
+        try e1;
+        try e2;
+    }
+
+    fn kill(self: *Perf, io: Io) !void {
+        closeFdLog(self.ack_pipe);
+        closeFdLog(self.ctl_pipe);
+        self.child_proc.kill(io);
+    }
+
+    fn enable(self: *Perf) !void {
+        try self.send_msg("enable");
+    }
+
+    fn stop(self: *Perf) !void {
+        try self.send_msg("stop");
+    }
+
+    fn send_msg(self: *Perf, msg: []const u8) !void {
+        var written = 0;
+        while (written < msg.len) {
+            const write_rc = linux.write(self.ctl_pipe, msg[written..], msg.len - written);
+            const n = try switch (errno(write_rc)) {
+                .SUCCESS => @as(i32, @intCast(write_rc)),
+                .INTR => continue,
+                .BADF, .FAULT, .INVAL, .FBIG => |e| errnoBug("write", e),
+                else => |e| errnoUnexpected("write", e),
+            };
+            written += n;
+        }
+
+        var read = 0;
+        var buf: [ack.len]u8 = undefined;
+        while (read < ack.len) {
+            const read_rc = linux.read(self.ack_pipe, buf[read..], ack.len - read);
+            const n = try switch (errno(read_rc)) {
+                .SUCCESS => if (read_rc == 0) error.UnexpectedEof else @as(i32, @intCast(read_rc)),
+                .INTR => continue,
+                .BADF, .FAULT, .INVAL => |e| errnoBug("read", e),
+                else => |e| errnoUnexpected("read", e),
+            };
+            read += n;
+        }
+    }
+
+    fn record(io: Io, arena: *ArenaAllocator, pid: i32) !Perf {
+        const pipe_pairs: PipePairs = try .init();
+        errdefer pipe_pairs.closeLogMine();
+
+        const child: process.Child = blk: {
+            errdefer pipe_pairs.closeTheirs() catch {};
+
+            const argv = [_][]const u8{
+                "perf",
+                "record",
+                "-g",
+                "-e",
+                "cycles",
+                "-p",
+                try pidStr(arena, pid),
+                "--delay=-1",
+                try controlFdArg(arena, pipe_pairs[2], pipe_pairs[1]),
+            };
+
+            try pipe_pairs.noCloExecTheirs();
+            break :blk try process.spawn(io, .{ .argv = argv });
+        };
+
+        try pipe_pairs.closeTheirs();
+
+        return .{ .child_proc = child, .ack_pipe = pipe_pairs.my_r, .ctl_pipe = pipe_pairs.my_w };
+    }
+
+    fn controlFdArg(
+        arena: *ArenaAllocator,
+        they_read: i32,
+        they_write: i32,
+    ) error{OutOfMemory}![]u8 {
+        return std.fmt.allocPrint(
+            arena.allocator(),
+            "--control=fd:{},{}",
+            .{ they_read, they_write },
+        );
+    }
+
+    fn pidStr(arena: *ArenaAllocator, pid: i32) error{OutOfMemory}![]u8 {
+        return std.fmt.allocPrint(arena.allocator(), "{}", .{pid});
+    }
+
+    /// Makes a pipe with CLOEXEC.
+    fn makePipe() error{Unexpected}![2]i32 {
+        var fds = [2]i32{ -1, -1 };
+
+        const pipe_rc = linux.pipe2(&fds, .{ .CLOEXEC = true });
+        try switch (errno(pipe_rc)) {
+            .SUCCESS => {},
+            .FAULT, .INVAL => errnoBug(),
+            else => |e| return errnoUnexpected("pipe", e),
+        };
+
+        return fds;
+    }
+
+    fn noCloexec(fd: i32) error{Unexpected}!void {
+        var flags = try getFdFlags(fd);
+        flags &= ~linux.FD_CLOEXEC;
+        return switch (errno(linux.fcntl(fd, linux.F.SETFD, flags))) {
+            .SUCCESS => {},
+            .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
+            else => |e| errnoUnexpected("fcntl", e),
+        };
+    }
+
+    fn getFdFlags(fd: i32) error{Unexpected}!i32 {
+        const f_rc = linux.fcntl(fd, linux.F.GETFD, 0);
+        return switch (errno(f_rc)) {
+            .SUCCESS => @as(i32, @intCast(f_rc)),
+            .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
+            else => |e| errnoUnexpected("fcntl", e),
+        };
     }
 };
 
