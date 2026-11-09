@@ -29,7 +29,6 @@ const CommandSpec = union(enum) {
             }
         }
     },
-    restore,
 };
 
 fn FieldSpec(T: type) type {

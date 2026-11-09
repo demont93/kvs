@@ -83,11 +83,23 @@ const CountAllocator = struct {
     }
 };
 
+pub const Report = struct {
+    allocations: usize,
+};
+
+pub const Messages = enum(u8) {
+    end,
+};
+
 pub const Context = struct {
     cpu: linux.cpu_set_t,
 };
 
-pub fn processMain(ctx: *const Context) callconv(.c) u8 {
+pub const ExitCode = enum(u8) {
+    success,
+};
+
+pub fn processMain(ctx: usize) callconv(.c) u8 {
     _ = ctx;
     @panic("unimplemented");
 }
