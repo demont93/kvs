@@ -13,6 +13,6 @@ pub fn main(init: std.process.Init) !void {
     const maybe_cmd = try cli.run(init.arena, &args);
 
     if (maybe_cmd) |cmd| switch (cmd) {
-        .run => |inner| try runner.run(init.io, init.arena, inner),
+        .run => |inner| try runner.run(init.io, init.arena, inner, .{}),
     };
 }

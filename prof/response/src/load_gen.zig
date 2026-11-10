@@ -6,6 +6,7 @@ const Self = @This();
 pub const Context = struct {
     workload: Workload,
     cpu: linux.cpu_set_t,
+    sock: i32,
 };
 
 pub const Workload = struct {
@@ -33,6 +34,11 @@ pub const Message = enum(u8) {
 
 pub const ExitCode = enum(u8) {
     success = 0,
+    err = 1,
+
+    pub fn value(self: ExitCode) u8 {
+        return @intFromEnum(self);
+    }
 };
 
 pub fn processMain(arg: usize) callconv(.c) u8 {

@@ -87,16 +87,22 @@ pub const Report = struct {
     allocations: usize,
 };
 
-pub const Messages = enum(u8) {
+pub const Message = enum(u8) {
     end,
 };
 
 pub const Context = struct {
     cpu: linux.cpu_set_t,
+    sock: i32,
 };
 
 pub const ExitCode = enum(u8) {
-    success,
+    success = 0,
+    err = 1,
+
+    pub fn value(self: ExitCode) u8 {
+        return @intFromEnum(self);
+    }
 };
 
 pub fn processMain(ctx: usize) callconv(.c) u8 {
