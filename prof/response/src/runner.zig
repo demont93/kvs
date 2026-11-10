@@ -251,9 +251,9 @@ const Perf = struct {
 
             return .{
                 .my_r = pipes1[0],
-                .my_w = pipes1[1],
+                .my_w = pipes2[1],
                 .their_r = pipes2[0],
-                .their_w = pipes2[1],
+                .their_w = pipes1[1],
             };
         }
 
