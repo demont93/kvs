@@ -47,9 +47,7 @@ const Runner = struct {
         self.server_handle.close() catch {};
     }
 
-    const ProfileError = error{};
-
-    fn profile(self: *Runner, io: Io, arena: *ArenaAllocator) ProfileError!void {
+    fn profile(self: *Runner, io: Io, arena: *ArenaAllocator) !void {
         var report: srv.Report = undefined;
         var perf = try Perf.record(io, arena, self.server_handle.pid);
 
@@ -119,7 +117,7 @@ const ServerHandle = struct {
         ReadError,
     };
 
-    fn awaitResult(self: ServerHandle, report: *srv.Report) ReadMessageError!void {
+    fn awaitResult(self: *ServerHandle, report: *srv.Report) ReadMessageError!void {
         recvAll(self.sock, @ptrCast(report)) catch |err| switch (err) {
             error.UnexpectedEof => {
                 self.status = .done;
@@ -283,7 +281,7 @@ const Perf = struct {
             };
         }
 
-        fn noCloExecTheirs(self: PipePairs) !void {
+        fn noCloExecTheirs(self: PipePairs) error{Unexpected}!void {
             try noCloexec(self.their_r);
             try noCloexec(self.their_w);
         }
@@ -520,7 +518,12 @@ fn openLoadGen(ctx: *load_gen.Context) error{ Unexpected, OutOfMemory, CloseFail
     return LoadGenHandle{ .sock = socks[1], .pid = pid };
 }
 
-fn clone(arg: *anyopaque, f: *const fn (usize) callconv(.c) u8) !i32 {
+const CloneError = error{
+    Unexpected,
+    OutOfMemory,
+};
+
+fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) CloneError!i32 {
     const stack = try makeStack();
     defer destroyStack(stack);
 
@@ -766,3 +769,26 @@ test "setCpuset" {
     set = std.mem.zeroes(linux.cpu_set_t);
     try testing.expectError(error.CpuOutOfBounds, setCpuset(&set, std.math.maxInt(i32)));
 }
+
+// test "run a test" {}
+
+// const CloneTarget = *fn (arg: usize) callconv(.c) u8;
+
+// const Tester = struct {
+//     fn init(
+//         fakeServFunc: CloneTarget,
+//         fakeLgenFunc: CloneTarget,
+//         fakePerfFunc: CloneTarget,
+//     ) void {
+//         _ = fakeServFunc;
+//         _ = fakeLgenFunc;
+//         _ = fakePerfFunc;
+
+//         @panic("unimplemented");
+//     }
+
+//     /// Creates a Child struct manually. This may break with std changes.
+//     fn spawnChild(f: CloneTarget) !process.Child {
+//         clone(null, f);
+//     }
+// };
