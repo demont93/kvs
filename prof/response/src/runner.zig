@@ -406,7 +406,7 @@ const Perf = struct {
         // process. Store the pid and signal it on error to avoid leaks.
         const child_pid = self.child_proc.id.?;
 
-        _ = self.child_proc.wait(io) catch |err| {
+        const termination = timeoutWait(io, &self.child_proc) catch |err| {
             std.debug.print("perf wait error: {t}\n", .{err});
 
             // kill with stored pid.
@@ -428,7 +428,55 @@ const Perf = struct {
             return error.Err;
         };
 
+        switch (termination) {
+            .exited => |v| if (v != 0) return logErr("perf exited with error\n", .{}),
+            .signal => |v| return logErr("perf exited with signal: {t}\n", .{v}),
+            else => return logErr("perf exited ungracefully\n", .{}),
+        }
         try write_pipe_close_result;
+    }
+
+    fn timeoutWait(io: Io, child: *process.Child) error{Canceled}!process.Child.Term {
+        const SelectResult = union(enum) {
+            timeout: error{Canceled}!void,
+            wait: process.Child.WaitError!process.Child.Term,
+        };
+        const Select = Io.Select(SelectResult);
+
+        var buf: [2]SelectResult = undefined;
+        var s = Select.init(io, &buf);
+
+        s.concurrent(
+            .timeout,
+            Io.sleep,
+            .{ io, .fromSeconds(2), .awake },
+        ) catch |e| panic("{t}\n", .{e});
+
+        s.concurrent(
+            .wait,
+            process.Child.wait,
+            .{ child, io },
+        ) catch |e| panic("{t}\n", .{e});
+
+        const result = try s.await();
+
+        if (s.cancel()) |r| switch (r) {
+            .wait => |v| return v catch |e| handleWaitError(e),
+            else => {},
+        };
+
+        switch (result) {
+            .timeout => return error.Canceled,
+            .wait => |v| return v catch |e| handleWaitError(e),
+        }
+    }
+
+    fn handleWaitError(err: process.Child.WaitError) error{Canceled} {
+        switch (err) {
+            error.Canceled => |e| return e,
+            error.AccessDenied => panic("access denied while waiting for prof pid\n", .{}),
+            error.Unexpected => panic("unexpected zig std lib syscall error\n", .{}),
+        }
     }
 
     fn kill(self: *Perf, io: Io) void {
