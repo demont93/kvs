@@ -12,6 +12,8 @@ const testing = std.testing;
 const load_gen = @import("load_gen.zig");
 const srv = @import("srv.zig");
 
+const Err = error{Err};
+
 const Runner = struct {
     // fd numbers
     const fd_lgen = 0;
@@ -25,7 +27,9 @@ const Runner = struct {
         self: *Runner,
         server_ctx: *srv.Context,
         lg_ctx: *load_gen.Context,
-    ) error{ Unexpected, OutOfMemory, CloseFailed }!void {
+    ) Err!void {
+        errdefer logErr("initializing runner\n", .{}) catch {};
+
         self.lg_handle = try openLoadGen(lg_ctx);
 
         self.server_handle = openServer(server_ctx) catch |e| {
@@ -34,20 +38,25 @@ const Runner = struct {
         };
     }
 
-    fn wait(self: *Runner) error{UngracefulShutdown}!void {
+    fn wait(self: *Runner) Err!void {
+        errdefer logErr("waiting for runner children\n", .{}) catch {};
+
         const lgen_result = self.lg_handle.wait();
         const serv_result = self.server_handle.close();
 
-        lgen_result catch return error.UngracefulShutdown;
-        serv_result catch return error.UngracefulShutdown;
+        try lgen_result;
+        try serv_result;
     }
 
     fn kill(self: *Runner) void {
+        logErr("killing runner children\n", .{}) catch {};
         self.lg_handle.kill();
         self.server_handle.close() catch {};
     }
 
     fn profile(self: *Runner, io: Io, arena: *ArenaAllocator) !void {
+        errdefer logErr("running profile on runner\n", .{}) catch {};
+
         var report: srv.Report = undefined;
         var perf = try Perf.record(io, arena, self.server_handle.pid);
 
@@ -83,7 +92,7 @@ const Runner = struct {
         }
     }
 
-    fn poll(poll_fds: []linux.pollfd) error{Unexpected}!i32 {
+    fn poll(poll_fds: []linux.pollfd) Err!i32 {
         while (true) {
             const poll_rc = linux.poll(poll_fds.ptr, poll_fds.len, -1);
 
@@ -102,9 +111,9 @@ const ServerHandle = struct {
     sock: i32,
     status: enum { running, done, unknown } = .running,
 
-    const UngracefulShutdown = error{ServerUngracefulShutdown};
+    fn close(self: *ServerHandle) Err!void {
+        errdefer logErr("closing server\n", .{}) catch {};
 
-    fn close(self: *ServerHandle) UngracefulShutdown!void {
         return switch (self.status) {
             .running => self.endWait(),
             .done => self.wait(),
@@ -112,60 +121,36 @@ const ServerHandle = struct {
         };
     }
 
-    const ReadMessageError = error{
-        ServerError,
-        ReadError,
-    };
+    fn awaitResult(self: *ServerHandle, report: *srv.Report) Err!void {
+        errdefer logErr("awaiting server result\n", .{}) catch {};
 
-    fn awaitResult(self: *ServerHandle, report: *srv.Report) ReadMessageError!void {
-        recvAll(self.sock, @ptrCast(report)) catch |err| switch (err) {
-            error.UnexpectedEof => {
-                self.status = .done;
-                return error.ReadError;
-            },
-            error.ClosedByPeer => {
-                self.status = .done;
-                return error.ServerError;
-            },
-            error.Unexpected => {
-                self.status = .unknown;
-                return error.ReadError;
-            },
+        recvAll(self.sock, @ptrCast(report)) catch |err| {
+            switch (err) {
+                error.UnexpectedEof => self.status = .done,
+                error.Err => self.status = .unknown,
+            }
+            return error.Err;
         };
     }
 
-    fn endWait(self: *ServerHandle) UngracefulShutdown!void {
-        self.end() catch |err| switch (err) {
-            error.UnexpectedWriteErr => {
-                self.kill();
-                return error.ServerUngracefulShutdown;
-            },
-            error.ClosedByPeer => {
-                std.debug.print("server connection closed unexpectedly\n", .{});
-            },
+    fn endWait(self: *ServerHandle) Err!void {
+        self.end() catch {
+            self.kill();
+            return;
         };
         try self.wait();
     }
 
-    const WriteMessageError = error{ UnexpectedWriteErr, ClosedByPeer };
-
-    fn end(self: *ServerHandle) WriteMessageError!void {
-        const msg = @intFromEnum(srv.Messages.end);
-        sendAll(self.sock, @as(*const [1]u8, &msg)) catch |err| switch (err) {
-            error.Unexpected => {
-                self.status = .unknown;
-                return error.UnexpectedWriteErr;
-            },
-            error.ClosedByPeer => |e| {
-                self.status = .done;
-                return e;
-            },
-        };
+    fn end(self: *ServerHandle) Err!void {
         self.status = .done;
+        const msg = @intFromEnum(srv.Messages.end);
+        try sendAll(self.sock, @as(*const [1]u8, &msg));
     }
 
-    fn wait(self: *ServerHandle) UngracefulShutdown!void {
-        const code = waitHandle(&self.pid, &self.sock) catch return error.ServerUngracefulShutdown;
+    fn wait(self: *ServerHandle) Err!void {
+        errdefer logErr("waiting for server pid\n", .{}) catch {};
+
+        const code = try waitHandle(&self.pid, &self.sock);
 
         switch (@as(srv.ExitCode, @enumFromInt(code))) {
             .success => {},
@@ -182,19 +167,19 @@ const LoadGenHandle = struct {
     pid: i32,
     sock: i32,
 
-    const MessageError = error{LgError} || RecvCodeError;
-
-    fn awaitDone(self: *LoadGenHandle) MessageError!void {
+    fn awaitDone(self: *LoadGenHandle) Err!void {
+        errdefer logErr("awaiting done message from load generator\n", .{});
         return switch (try self.recvCode()) {
-            .err => error.LgError,
+            .err => logErr("received err message\n", .{}),
             .done => {},
             else => |m| invalidMessageReceived(m),
         };
     }
 
-    fn awaitReady(self: *LoadGenHandle) MessageError!void {
+    fn awaitReady(self: *LoadGenHandle) Err!void {
+        errdefer logErr("awaiting ready message from load generator\n", .{});
         return switch (try self.recvCode()) {
-            .err => error.LgError,
+            .err => logErr("received err message\n", .{}),
             .ready => {},
             else => |m| invalidMessageReceived(m),
         };
@@ -203,26 +188,17 @@ const LoadGenHandle = struct {
     /// Messages the Load Generator to start the measure phase. Should be sent after attaching
     /// profiler and other tooling and receiving ready from the load generator, indicating all
     /// setup was performed.
-    fn start(self: *LoadGenHandle) !void {
+    fn start(self: *LoadGenHandle) Err!void {
+        errdefer logErr("starting load generator\n", .{}) catch {};
+
         const msg = @intFromEnum(load_gen.Message.start);
-        sendAll(self.sock, @as(*const [1]u8, &msg)) catch |err| return switch (err) {
-            error.ClosedByPeer => error.LoadGenClosed,
-            error.Unexpected => error.Unexpected,
-        };
+        try sendAll(self.sock, @as(*const [1]u8, &msg));
     }
 
-    const RecvCodeError = error{
-        LgClosed,
-        Unexpected,
-    };
-
-    fn recvCode(self: *LoadGenHandle) RecvCodeError!load_gen.Message {
+    fn recvCode(self: *LoadGenHandle) Err!load_gen.Message {
         var buf: [1]u8 = undefined;
 
-        recvAll(self.sock, &buf) catch |err| return switch (err) {
-            error.ClosedByPeer, error.UnexpectedEof => error.LgClosed,
-            error.Unexpected => |e| e,
-        };
+        recvAll(self.sock, &buf) catch return Err.Err;
 
         const msg = std.enums.fromInt(load_gen.Message, buf[0]) orelse
             panic("invalid message from load generator: {}\n", .{buf[0]});
@@ -237,16 +213,17 @@ const LoadGenHandle = struct {
         panic("invalid message from load generator: {t}", .{msg});
     }
 
-    const UngracefulShutdown = error{LoadGenUngracefulShutdown};
+    fn wait(self: *LoadGenHandle) Err!void {
+        errdefer logErr("waiting for load generator pid\n", .{}) catch {};
 
-    fn wait(self: *LoadGenHandle) !void {
-        const code = waitHandle(&self.pid, &self.sock) catch return error.LoadGenUngracefulShutdown;
+        const code = waitHandle(&self.pid, &self.sock) catch return Err.Err;
         switch (@as(load_gen.ExitCode, @enumFromInt(code))) {
             .success => {},
         }
     }
 
     fn kill(self: *LoadGenHandle) void {
+        std.debug.print("load generator process killed\n", .{});
         return killHandle(&self.pid, &self.sock);
     }
 };
@@ -257,7 +234,6 @@ const Perf = struct {
     child_proc: process.Child,
     ack_pipe: i32,
     ctl_pipe: i32,
-    status: enum { idle, running, stopped } = .idle,
 
     const PipePairs = struct {
         my_r: i32,
@@ -265,7 +241,7 @@ const Perf = struct {
         their_r: i32,
         their_w: i32,
 
-        fn init() error{Unexpected}!PipePairs {
+        fn init() Err!PipePairs {
             const pipes1 = try makePipe();
             errdefer {
                 closeFdLog(pipes1[0]);
@@ -281,7 +257,7 @@ const Perf = struct {
             };
         }
 
-        fn noCloExecTheirs(self: PipePairs) error{Unexpected}!void {
+        fn noCloExecTheirs(self: PipePairs) Err!void {
             try noCloexec(self.their_r);
             try noCloexec(self.their_w);
         }
@@ -291,7 +267,7 @@ const Perf = struct {
             closeFdLog(self.my_w);
         }
 
-        fn closeTheirs(self: *PipePairs) CloseError!void {
+        fn closeTheirs(self: *PipePairs) Err!void {
             const r1 = closeFd(self.their_r);
             const r2 = closeFd(self.their_w);
 
@@ -300,9 +276,9 @@ const Perf = struct {
         }
     };
 
-    const PerfWaitError = error{ PerfKilled, PerfCloseFailed };
+    fn wait(self: *Perf, io: Io) Err!void {
+        errdefer logErr("waiting for perf pid\n", .{}) catch {};
 
-    fn wait(self: *Perf, io: Io) PerfWaitError!void {
         closeFdLog(self.ack_pipe);
         const write_pipe_close_result = closeFd(self.ctl_pipe);
 
@@ -329,12 +305,10 @@ const Perf = struct {
                 }
             }
 
-            return error.PerfKilled;
+            return error.Err;
         };
 
-        write_pipe_close_result catch |err| return switch (err) {
-            error.CloseFailed, error.Unexpected => error.PerfCloseFailed,
-        };
+        try write_pipe_close_result;
     }
 
     fn kill(self: *Perf, io: Io) void {
@@ -344,14 +318,18 @@ const Perf = struct {
     }
 
     fn enable(self: *Perf) !void {
+        errdefer logErr("enabling perf\n", .{}) catch {};
         try self.send_msg("enable");
     }
 
     fn stop(self: *Perf) !void {
+        errdefer logErr("stopping perf\n", .{}) catch {};
         try self.send_msg("stop");
     }
 
-    fn send_msg(self: *Perf, msg: []const u8) !void {
+    fn send_msg(self: *Perf, msg: []const u8) Err!void {
+        errdefer logErr("sending msg to perf\n", .{}) catch {};
+
         var n_written: usize = 0;
         while (n_written < msg.len) {
             const write_rc = linux.write(self.ctl_pipe, msg[n_written..].ptr, msg.len - n_written);
@@ -369,7 +347,10 @@ const Perf = struct {
         while (n_read < ack.len) {
             const read_rc = linux.read(self.ack_pipe, buf[n_read..].ptr, ack.len - n_read);
             const n = try switch (errno(read_rc)) {
-                .SUCCESS => if (read_rc == 0) error.UnexpectedEof else read_rc,
+                .SUCCESS => if (read_rc == 0)
+                    logErr("unexpected eof\n", .{})
+                else
+                    read_rc,
                 .INTR => continue,
                 .BADF, .FAULT, .INVAL => |e| errnoBug("read", e),
                 else => |e| errnoUnexpected("read", e),
@@ -378,7 +359,9 @@ const Perf = struct {
         }
     }
 
-    fn record(io: Io, arena: *ArenaAllocator, pid: i32) !Perf {
+    fn record(io: Io, arena: *ArenaAllocator, pid: i32) Err!Perf {
+        errdefer logErr("recording with perf\n", .{}) catch {};
+
         var pipe_pairs: PipePairs = try .init();
         errdefer pipe_pairs.closeLogMine();
 
@@ -398,7 +381,9 @@ const Perf = struct {
             };
 
             try pipe_pairs.noCloExecTheirs();
-            break :blk try process.spawn(io, .{ .argv = &argv });
+            break :blk process.spawn(io, .{ .argv = &argv }) catch |err| switch (err) {
+                else => |e| return logErr("failed to spawn perf: {t}\n", .{e}),
+            };
         };
 
         try pipe_pairs.closeTheirs();
@@ -410,20 +395,21 @@ const Perf = struct {
         arena: *ArenaAllocator,
         they_read: i32,
         they_write: i32,
-    ) error{OutOfMemory}![]u8 {
+    ) Err![]u8 {
         return std.fmt.allocPrint(
             arena.allocator(),
             "--control=fd:{},{}",
             .{ they_read, they_write },
-        );
+        ) catch logErr("out of memory\n", .{});
     }
 
-    fn pidStr(arena: *ArenaAllocator, pid: i32) error{OutOfMemory}![]u8 {
-        return std.fmt.allocPrint(arena.allocator(), "{}", .{pid});
+    fn pidStr(arena: *ArenaAllocator, pid: i32) Err![]u8 {
+        return std.fmt.allocPrint(arena.allocator(), "{}", .{pid}) catch
+            logErr("out of memory\n", .{});
     }
 
     /// Makes a pipe with CLOEXEC.
-    fn makePipe() error{Unexpected}![2]i32 {
+    fn makePipe() Err![2]i32 {
         var fds = [2]i32{ -1, -1 };
 
         const pipe_rc = linux.pipe2(&fds, .{ .CLOEXEC = true });
@@ -436,7 +422,7 @@ const Perf = struct {
         return fds;
     }
 
-    fn noCloexec(fd: i32) error{Unexpected}!void {
+    fn noCloexec(fd: i32) Err!void {
         var flags: usize = @intCast(try getFdFlags(fd));
         flags &= ~@as(usize, linux.FD_CLOEXEC);
         return switch (errno(linux.fcntl(fd, linux.F.SETFD, flags))) {
@@ -446,7 +432,7 @@ const Perf = struct {
         };
     }
 
-    fn getFdFlags(fd: i32) error{Unexpected}!i32 {
+    fn getFdFlags(fd: i32) Err!i32 {
         const f_rc = linux.fcntl(fd, linux.F.GETFD, 0);
         return switch (errno(f_rc)) {
             .SUCCESS => @as(i32, @intCast(f_rc)),
@@ -456,7 +442,7 @@ const Perf = struct {
     }
 };
 
-pub fn run(io: Io, arena: *ArenaAllocator, cmd: anytype) !void {
+pub fn run(io: Io, arena: *ArenaAllocator, cmd: anytype) Err!void {
     var server_ctx: srv.Context = .{
         .cpu = try cpuNSet(cmd.cpu1),
     };
@@ -482,7 +468,9 @@ pub fn run(io: Io, arena: *ArenaAllocator, cmd: anytype) !void {
     try runner.wait();
 }
 
-fn openServer(ctx: *srv.Context) error{ Unexpected, OutOfMemory, CloseFailed }!ServerHandle {
+fn openServer(ctx: *srv.Context) Err!ServerHandle {
+    errdefer logErr("opening server\n", .{}) catch {};
+
     const socks = try socketPair();
 
     const pid = clone(ctx, &srv.processMain) catch |e| {
@@ -500,7 +488,9 @@ fn openServer(ctx: *srv.Context) error{ Unexpected, OutOfMemory, CloseFailed }!S
     return ServerHandle{ .pid = pid, .sock = socks[1] };
 }
 
-fn openLoadGen(ctx: *load_gen.Context) error{ Unexpected, OutOfMemory, CloseFailed }!LoadGenHandle {
+fn openLoadGen(ctx: *load_gen.Context) Err!LoadGenHandle {
+    errdefer logErr("opening load generator\n", .{}) catch {};
+
     const socks = try socketPair();
 
     const pid = clone(ctx, &load_gen.processMain) catch |e| {
@@ -518,12 +508,9 @@ fn openLoadGen(ctx: *load_gen.Context) error{ Unexpected, OutOfMemory, CloseFail
     return LoadGenHandle{ .sock = socks[1], .pid = pid };
 }
 
-const CloneError = error{
-    Unexpected,
-    OutOfMemory,
-};
+fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) Err!i32 {
+    errdefer logErr("clone\n", .{}) catch {};
 
-fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) CloneError!i32 {
     const stack = try makeStack();
     defer destroyStack(stack);
 
@@ -543,7 +530,7 @@ fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) CloneError!i32 
     };
 }
 
-fn makeStack() error{ OutOfMemory, Unexpected }![]u8 {
+fn makeStack() Err![]u8 {
     const mmap_rc = linux.mmap(
         null,
         1 << 20,
@@ -555,7 +542,7 @@ fn makeStack() error{ OutOfMemory, Unexpected }![]u8 {
 
     return switch (errno(mmap_rc)) {
         .SUCCESS => @as([*]u8, @ptrFromInt(mmap_rc))[0 .. 1 << 20],
-        .NOMEM => error.OutOfMemory,
+        .NOMEM => logErr("mmap: out of memory\n", .{}),
         .AGAIN,
         .BADF,
         .EXIST,
@@ -577,18 +564,10 @@ fn destroyStack(stack: []u8) void {
     }
 }
 
-const CloseError = error{
-    CloseFailed,
-    Unexpected,
-};
-
-fn closeFd(fd: i32) CloseError!void {
+fn closeFd(fd: i32) Err!void {
     return switch (errno(linux.close(fd))) {
         .SUCCESS => {},
-        .INTR, .IO => |e| blk: {
-            std.debug.print("close failed: {t}\n", .{e});
-            break :blk error.CloseFailed;
-        },
+        .INTR, .IO => |e| logErr("close failed: {t}\n", .{e}),
         .BADF => |e| errnoBug("close", e),
         else => |e| errnoUnexpected("close", e),
     };
@@ -598,7 +577,7 @@ fn closeFdLog(fd: i32) void {
     closeFd(fd) catch {};
 }
 
-fn socketPair() error{Unexpected}![2]i32 {
+fn socketPair() Err![2]i32 {
     var socks: [2]i32 = undefined;
 
     try switch (errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks))) {
@@ -613,9 +592,7 @@ fn socketPair() error{Unexpected}![2]i32 {
     return socks;
 }
 
-const WaitHandleError = error{ChildSignaled} || CloseError;
-
-fn waitHandle(pid: *i32, sock_fd: *i32) WaitHandleError!u8 {
+fn waitHandle(pid: *i32, sock_fd: *i32) Err!u8 {
     const close_result = closeFd(sock_fd.*);
     sock_fd.* = -1;
     const code = waitChild(pid.*);
@@ -634,7 +611,7 @@ fn killHandle(pid: *i32, sock_fd: *i32) void {
     sock_fd.* = -1;
 }
 
-fn waitChild(pid: i32) error{ChildSignaled}!u8 {
+fn waitChild(pid: i32) Err!u8 {
     var status: u32 = undefined;
 
     while (true) {
@@ -659,7 +636,7 @@ fn waitChild(pid: i32) error{ChildSignaled}!u8 {
         }
 
         std.debug.print("child exited with signal {s}\n", .{cause});
-        return error.ChildSignaled;
+        return Err.Err;
     }
 }
 
@@ -677,12 +654,7 @@ fn killChild(pid: i32) void {
     }
 }
 
-const SendAllError = error{
-    ClosedByPeer,
-    Unexpected,
-};
-
-fn sendAll(fd: i32, buf: []const u8) SendAllError!void {
+fn sendAll(fd: i32, buf: []const u8) Err!void {
     var n_written: usize = 0;
     while (n_written < buf.len) {
         const write_rc = linux.write(fd, buf.ptr + n_written, buf.len - n_written);
@@ -695,7 +667,7 @@ fn sendAll(fd: i32, buf: []const u8) SendAllError!void {
             .BADF,
             .NOTSOCK,
             => |e| errnoBug("write", e),
-            .CONNRESET, .PIPE => error.ClosedByPeer,
+            .CONNRESET, .PIPE => logErr("connection closed by peer\n", .{}),
             else => |e| errnoUnexpected("write", e),
         };
 
@@ -705,18 +677,16 @@ fn sendAll(fd: i32, buf: []const u8) SendAllError!void {
 
 const ReadAllError = error{
     UnexpectedEof,
-    ClosedByPeer,
-    Unexpected,
-};
+} || Err;
 
 fn recvAll(fd: i32, buf: []u8) ReadAllError!void {
     var n_read: usize = 0;
     while (n_read < buf.len) {
         const read_rc = linux.read(fd, buf[n_read..].ptr, buf.len - n_read);
         const n = try switch (errno(read_rc)) {
-            .SUCCESS => if (read_rc == 0) error.UnexpectedEof else read_rc,
+            .SUCCESS => if (read_rc == 0) ReadAllError.UnexpectedEof else read_rc,
             .INTR => continue,
-            .PIPE, .CONNRESET => error.ClosedByPeer,
+            .PIPE, .CONNRESET => logErr("connection reset by peer\n", .{}),
             .AGAIN,
             .BADF,
             .FAULT,
@@ -730,20 +700,20 @@ fn recvAll(fd: i32, buf: []u8) ReadAllError!void {
     }
 }
 
-fn cpuNSet(n: i32) !linux.cpu_set_t {
+fn cpuNSet(n: i32) Err!linux.cpu_set_t {
     var set = std.mem.zeroes(linux.cpu_set_t);
     try setCpuset(&set, n);
     return set;
 }
 
-fn setCpuset(set: *linux.cpu_set_t, n: i32) !void {
+fn setCpuset(set: *linux.cpu_set_t, n: i32) Err!void {
     const Elem = @typeInfo(linux.cpu_set_t).array.child;
 
-    const nu = std.math.cast(u32, n) orelse return error.InvalidCpu;
+    const nu = std.math.cast(u32, n) orelse return logErr("invalid cpu number: {}\n", .{n});
 
     const index = nu / @bitSizeOf(Elem);
     if (index >= (@sizeOf(linux.cpu_set_t) / @sizeOf(Elem))) {
-        return error.CpuOutOfBounds;
+        return logErr("cpu number out of bounds: {}\n", .{n});
     }
 
     const pos: @Int(.unsigned, std.math.log2(@bitSizeOf(Elem))) = @intCast(nu % @bitSizeOf(Elem));
@@ -756,9 +726,14 @@ fn errnoBug(call: []const u8, e: linux.E) noreturn {
     std.debug.panic("errno bug when calling {s}: {t}\n", .{ call, e });
 }
 
-fn errnoUnexpected(call: []const u8, e: linux.E) error{Unexpected} {
+fn errnoUnexpected(call: []const u8, e: linux.E) Err {
     std.debug.print("unexpected errno when calling {s}: {t}\n", .{ call, e });
-    return error.Unexpected;
+    return Err.Err;
+}
+
+fn logErr(comptime fmt: []const u8, args: anytype) Err {
+    std.debug.print(fmt, args);
+    return Err.Err;
 }
 
 test "setCpuset" {
@@ -767,28 +742,5 @@ test "setCpuset" {
     try testing.expectEqual(1, linux.CPU_COUNT(set));
     try testing.expectEqual(128, set[0]);
     set = std.mem.zeroes(linux.cpu_set_t);
-    try testing.expectError(error.CpuOutOfBounds, setCpuset(&set, std.math.maxInt(i32)));
+    try testing.expectError(Err.Err, setCpuset(&set, std.math.maxInt(i32)));
 }
-
-// test "run a test" {}
-
-// const CloneTarget = *fn (arg: usize) callconv(.c) u8;
-
-// const Tester = struct {
-//     fn init(
-//         fakeServFunc: CloneTarget,
-//         fakeLgenFunc: CloneTarget,
-//         fakePerfFunc: CloneTarget,
-//     ) void {
-//         _ = fakeServFunc;
-//         _ = fakeLgenFunc;
-//         _ = fakePerfFunc;
-
-//         @panic("unimplemented");
-//     }
-
-//     /// Creates a Child struct manually. This may break with std changes.
-//     fn spawnChild(f: CloneTarget) !process.Child {
-//         clone(null, f);
-//     }
-// };
