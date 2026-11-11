@@ -73,7 +73,7 @@ pub fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) Err!i32 {
 
     return switch (errno(clone_rc)) {
         .SUCCESS => @intCast(clone_rc),
-        else => |e| errnoUnexpected("clone", e),
+        else => |e| errnoUnexpectedErr("clone", e),
     };
 }
 
@@ -100,7 +100,7 @@ fn makeStack() Err![]u8 {
         .PERM,
         .TXTBSY,
         => |e| errnoBug("mmap", e),
-        else => |e| errnoUnexpected("mmap", e),
+        else => |e| errnoUnexpectedErr("mmap", e),
     };
 }
 
@@ -120,7 +120,7 @@ pub fn socketPair() Err![2]i32 {
         .PROTONOSUPPORT,
         .AFNOSUPPORT,
         => |e| errnoBug("socketpair", e),
-        else => |e| errnoUnexpected("socketpair", e),
+        else => |e| errnoUnexpectedErr("socketpair", e),
     };
 
     return socks;
@@ -132,7 +132,7 @@ pub fn noCloexec(fd: i32) Err!void {
     return switch (errno(linux.fcntl(fd, linux.F.SETFD, flags))) {
         .SUCCESS => {},
         .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
-        else => |e| errnoUnexpected("fcntl", e),
+        else => |e| errnoUnexpectedErr("fcntl", e),
     };
 }
 
@@ -141,7 +141,7 @@ fn getFdFlags(fd: i32) Err!i32 {
     return switch (errno(f_rc)) {
         .SUCCESS => @as(i32, @intCast(f_rc)),
         .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
-        else => |e| errnoUnexpected("fcntl", e),
+        else => |e| errnoUnexpectedErr("fcntl", e),
     };
 }
 
@@ -150,7 +150,7 @@ pub fn closeFd(fd: i32) Err!void {
         .SUCCESS => {},
         .INTR, .IO => |e| logErr("close failed: {t}\n", .{e}),
         .BADF => |e| errnoBug("close", e),
-        else => |e| errnoUnexpected("close", e),
+        else => |e| errnoUnexpectedErr("close", e),
     };
 }
 
@@ -209,6 +209,11 @@ pub fn errnoBug(call: []const u8, e: linux.E) noreturn {
 pub fn errnoUnexpected(call: []const u8, e: linux.E) error{Unexpected} {
     std.debug.print("unexpected errno when calling {s}: {t}\n", .{ call, e });
     return error.Unexpected;
+}
+
+pub fn errnoUnexpectedErr(call: []const u8, e: linux.E) Err {
+    std.debug.print("unexpected errno when calling {s}: {t}\n", .{ call, e });
+    return Err.Err;
 }
 
 pub fn logErr(comptime fmt: []const u8, args: anytype) Err {
