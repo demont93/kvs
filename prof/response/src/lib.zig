@@ -145,6 +145,63 @@ fn getFdFlags(fd: i32) Err!i32 {
     };
 }
 
+pub fn closeFd(fd: i32) Err!void {
+    return switch (errno(linux.close(fd))) {
+        .SUCCESS => {},
+        .INTR, .IO => |e| logErr("close failed: {t}\n", .{e}),
+        .BADF => |e| errnoBug("close", e),
+        else => |e| errnoUnexpected("close", e),
+    };
+}
+
+pub fn closeFdLog(fd: i32) void {
+    closeFd(fd) catch {};
+}
+
+pub fn waitChild(pid: i32) Err!u8 {
+    var status: u32 = undefined;
+
+    while (true) {
+        switch (errno(linux.waitpid(pid, &status, 0))) {
+            .SUCCESS => break,
+            .INTR => continue,
+            else => |e| errnoBug("waitpid", e),
+        }
+    }
+
+    if (linux.W.IFEXITED(status)) {
+        return linux.W.EXITSTATUS(status);
+    } else {
+        var cause: []const u8 = undefined;
+
+        if (linux.W.IFSIGNALED(status)) {
+            cause = @tagName(linux.W.TERMSIG(status));
+        } else if (linux.W.IFSTOPPED(status)) {
+            cause = @tagName(@as(linux.SIG, @enumFromInt(linux.W.STOPSIG(status))));
+        } else {
+            std.debug.panic("child exited with unknown outcome\n", .{});
+        }
+
+        std.debug.print("child exited with signal {s}\n", .{cause});
+        return Err.Err;
+    }
+}
+
+pub fn killChild(pid: i32) void {
+    switch (errno(linux.kill(pid, linux.SIG.KILL))) {
+        .SUCCESS => {},
+        .SRCH => |e| errnoUnexpected("kill", e) catch {},
+        else => |e| errnoBug("kill", e),
+    }
+
+    var status: u32 = undefined;
+
+    switch (errno(linux.waitpid(pid, &status, 0))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("waitpid", e),
+    }
+}
+
 pub fn errnoBug(call: []const u8, e: linux.E) noreturn {
     std.debug.panic("errno bug when calling {s}: {t}\n", .{ call, e });
 }

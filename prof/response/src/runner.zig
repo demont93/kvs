@@ -135,14 +135,14 @@ const ServerHandle = struct {
         };
 
         const pid = lib.clone(ctx, spawn_func) catch |e| {
-            closeFdLog(socks[0]);
-            closeFdLog(socks[1]);
+            lib.closeFdLog(socks[0]);
+            lib.closeFdLog(socks[1]);
             return e;
         };
 
-        closeFd(socks[0]) catch |e| {
-            closeFdLog(socks[0]);
-            killChild(pid);
+        lib.closeFd(socks[0]) catch |e| {
+            lib.closeFdLog(socks[0]);
+            lib.killChild(pid);
             return e;
         };
 
@@ -223,14 +223,14 @@ const LoadGenHandle = struct {
         };
 
         const pid = lib.clone(ctx, spawn_func) catch |e| {
-            closeFdLog(socks[0]);
-            closeFdLog(socks[1]);
+            lib.closeFdLog(socks[0]);
+            lib.closeFdLog(socks[1]);
             return e;
         };
 
-        closeFd(socks[0]) catch |e| {
-            closeFdLog(socks[1]);
-            killChild(pid);
+        lib.closeFd(socks[0]) catch |e| {
+            lib.closeFdLog(socks[1]);
+            lib.killChild(pid);
             return e;
         };
 
@@ -315,8 +315,8 @@ const Perf = struct {
         fn init() Err!PipePairs {
             const pipes1 = try makePipe();
             errdefer {
-                closeFdLog(pipes1[0]);
-                closeFdLog(pipes1[1]);
+                lib.closeFdLog(pipes1[0]);
+                lib.closeFdLog(pipes1[1]);
             }
             const pipes2 = try makePipe();
 
@@ -334,13 +334,13 @@ const Perf = struct {
         }
 
         fn closeLogMine(self: *PipePairs) void {
-            closeFdLog(self.my_r);
-            closeFdLog(self.my_w);
+            lib.closeFdLog(self.my_r);
+            lib.closeFdLog(self.my_w);
         }
 
         fn closeTheirs(self: *PipePairs) Err!void {
-            const r1 = closeFd(self.their_r);
-            const r2 = closeFd(self.their_w);
+            const r1 = lib.closeFd(self.their_r);
+            const r2 = lib.closeFd(self.their_w);
 
             try r1;
             try r2;
@@ -407,8 +407,8 @@ const Perf = struct {
     fn wait(self: *Perf, io: Io) Err!void {
         errdefer logErr("waiting for perf pid\n", .{}) catch {};
 
-        closeFdLog(self.ack_pipe);
-        const write_pipe_close_result = closeFd(self.ctl_pipe);
+        lib.closeFdLog(self.ack_pipe);
+        const write_pipe_close_result = lib.closeFd(self.ctl_pipe);
 
         // There is a gap on the current standard where if io gets canceled, it leaks the
         // process. Store the pid and signal it on error to avoid leaks.
@@ -488,8 +488,8 @@ const Perf = struct {
     }
 
     fn kill(self: *Perf, io: Io) void {
-        closeFdLog(self.ack_pipe);
-        closeFdLog(self.ctl_pipe);
+        lib.closeFdLog(self.ack_pipe);
+        lib.closeFdLog(self.ctl_pipe);
         self.child_proc.kill(io);
     }
 
@@ -604,23 +604,10 @@ pub fn run(io: Io, arena: *ArenaAllocator, cmd: anytype, opts: RunOptions) Err!v
     try runner.wait();
 }
 
-fn closeFd(fd: i32) Err!void {
-    return switch (errno(linux.close(fd))) {
-        .SUCCESS => {},
-        .INTR, .IO => |e| logErr("close failed: {t}\n", .{e}),
-        .BADF => |e| errnoBug("close", e),
-        else => |e| errnoUnexpected("close", e),
-    };
-}
-
-fn closeFdLog(fd: i32) void {
-    closeFd(fd) catch {};
-}
-
 fn waitHandle(pid: *i32, sock_fd: *i32) Err!u8 {
-    const close_result = closeFd(sock_fd.*);
+    const close_result = lib.closeFd(sock_fd.*);
     sock_fd.* = -1;
-    const code = waitChild(pid.*);
+    const code = lib.waitChild(pid.*);
     pid.* = std.math.minInt(i32);
 
     _ = try code;
@@ -630,53 +617,10 @@ fn waitHandle(pid: *i32, sock_fd: *i32) Err!u8 {
 }
 
 fn killHandle(pid: *i32, sock_fd: *i32) void {
-    killChild(pid.*);
+    lib.killChild(pid.*);
     pid.* = std.math.minInt(i32);
-    closeFdLog(sock_fd.*);
+    lib.closeFdLog(sock_fd.*);
     sock_fd.* = -1;
-}
-
-fn waitChild(pid: i32) Err!u8 {
-    var status: u32 = undefined;
-
-    while (true) {
-        switch (errno(linux.waitpid(pid, &status, 0))) {
-            .SUCCESS => break,
-            .INTR => continue,
-            else => |e| errnoBug("waitpid", e),
-        }
-    }
-
-    if (linux.W.IFEXITED(status)) {
-        return linux.W.EXITSTATUS(status);
-    } else {
-        var cause: []const u8 = undefined;
-
-        if (linux.W.IFSIGNALED(status)) {
-            cause = @tagName(linux.W.TERMSIG(status));
-        } else if (linux.W.IFSTOPPED(status)) {
-            cause = @tagName(@as(linux.SIG, @enumFromInt(linux.W.STOPSIG(status))));
-        } else {
-            std.debug.panic("child exited with unknown outcome\n", .{});
-        }
-
-        std.debug.print("child exited with signal {s}\n", .{cause});
-        return Err.Err;
-    }
-}
-
-fn killChild(pid: i32) void {
-    switch (errno(linux.kill(pid, linux.SIG.KILL))) {
-        .SUCCESS, .SRCH => {},
-        else => |e| errnoBug("kill", e),
-    }
-
-    var status: u32 = undefined;
-
-    switch (errno(linux.waitpid(pid, &status, 0))) {
-        .SUCCESS => {},
-        else => |e| errnoBug("waitpid", e),
-    }
 }
 
 fn sendAll(fd: i32, buf: []const u8) Err!void {
