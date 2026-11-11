@@ -152,12 +152,16 @@ pub const Listener = struct {
         InsufficientMemory,
         TooManyOpenFiles,
         Firewall,
+        Stop,
     };
 
     pub fn accept(self: *Listener) AcceptError!Connection {
         var peer_addr: linux.sockaddr = undefined;
         var peer_addr_len: linux.socklen_t = @sizeOf(@TypeOf(peer_addr));
         const conn_sock_fd = while (true) {
+            if (stop.load(.monotonic)) {
+                return error.Stop;
+            }
             const accept_rc = linux.accept4(
                 self.sock_fd,
                 &peer_addr,
@@ -311,6 +315,10 @@ const RetryState = struct {
     }
 };
 
+/// Assumes that the process is single threaded. If the server gets more threads, the signal may
+/// land in any thread. While the variable will be set, the poll or connect may not get INTR'd.
+var stop: std.atomic.Value(bool) = .init(false);
+
 io: Io,
 listener: Listener,
 mem_buf: []align(std.atomic.cache_line) u8,
@@ -353,6 +361,8 @@ pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{O
     self.parser = .{};
 
     self.map = BufMap.init(allocator);
+
+    install_sig_handler();
 }
 
 pub fn listen_and_serve(
@@ -382,6 +392,7 @@ pub fn listen_and_serve(
             debug.print("error accepting connection: {s}\n", .{@errorName(err)});
             switch (err) {
                 error.InsufficientMemory, error.TooManyOpenFiles => self.retry_state.wait(self.io),
+                error.Stop => return,
                 else => self.retry_state.reset(),
             }
             continue;
@@ -395,6 +406,7 @@ pub fn listen_and_serve(
                     "connection error: unexpected {t}",
                     .{self.unexpected_errno},
                 ),
+                error.Stop => return log("request stopped", .{}),
                 else => debug.print(
                     "connection error {t} while {s}\n",
                     .{ diag.details, diag.action.description() },
@@ -423,6 +435,33 @@ pub fn close(self: *Self) void {
     self.map.deinit();
 }
 
+/// Assumes that the process is single threaded. If the server gets more threads, the signal may
+/// land in any thread. While the variable will be set, the poll or connect may not get INTR'd.
+fn install_sig_handler() void {
+    var mask = linux.sigemptyset();
+    linux.sigaddset(&mask, .TERM);
+    linux.sigaddset(&mask, .INT);
+
+    const act: linux.Sigaction = .{
+        .flags = 0,
+        .handler = .{ .handler = &sig_handler },
+        .mask = mask,
+    };
+    switch (linux.errno(linux.sigaction(.INT, &act, null))) {
+        .SUCCESS => {},
+        else => |e| syscall.errno_bug("sigaction", e),
+    }
+    switch (linux.errno(linux.sigaction(.TERM, &act, null))) {
+        .SUCCESS => {},
+        else => |e| syscall.errno_bug("sigaction", e),
+    }
+}
+
+fn sig_handler(signal: linux.SIG) callconv(.c) void {
+    _ = signal;
+    stop.store(true, .monotonic);
+}
+
 const RequestError = error{
     ConnectionReset,
     ReadTimeout,
@@ -430,6 +469,7 @@ const RequestError = error{
     OutOfMemory,
     BadRequest,
     Unexpected,
+    Stop,
 };
 
 fn handle_connection(
@@ -463,7 +503,7 @@ fn handle_request(
 
     const read_result = self.read_request(conn, diag, &req) catch |err| {
         const error_response = switch (err) {
-            error.ConnectionReset, error.Unexpected => |e| return e,
+            error.ConnectionReset, error.Unexpected, error.Stop => |e| return e,
             error.OutOfMemory => encode.internal,
             error.BadRequest => encode.invalid,
             error.ReadTimeout => encode.timeout,
@@ -536,6 +576,7 @@ const ReadRequestError = error{
     BadRequest,
     ReadTimeout,
     Unexpected,
+    Stop,
 };
 
 fn read_request(
@@ -610,6 +651,7 @@ const ReadError = error{
     OutOfMemory,
     ConnectionReset,
     Unexpected,
+    Stop,
 };
 
 fn read_buffered(
@@ -629,16 +671,22 @@ fn read_buffered(
 
         if (n == 0) {
             const pollfds: *[1]linux.pollfd = &pollfd;
-            _ = syscall.poll(
-                self.io,
-                pollfds,
-                deadline,
-                &self.unexpected_errno,
-            ) catch |e| return switch (e) {
-                error.Timeout => error.ReadTimeout,
-                error.TooManyPollFds => syscall.zerrno_bug("poll", e),
-                else => |e2| return e2,
-            };
+            while (true) {
+                if (stop.load(.monotonic)) {
+                    return error.Stop;
+                }
+                _ = syscall.pollintr(
+                    self.io,
+                    pollfds,
+                    deadline,
+                    &self.unexpected_errno,
+                ) catch |e| return switch (e) {
+                    error.Timeout => error.ReadTimeout,
+                    error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+                    error.Intr => continue,
+                    else => |e2| return e2,
+                };
+            }
 
             n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
                 error.Unexpected => |err| return err,

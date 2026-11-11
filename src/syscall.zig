@@ -108,16 +108,28 @@ pub fn poll(
     unexpected: ?*linux.E,
 ) PollError!usize {
     while (true) {
-        const timeout = timeout_remaining_ms(io, deadline) orelse return error.Timeout;
-        const poll_rc = linux.poll(fds.ptr, fds.len, timeout);
-        return switch (linux.errno(poll_rc)) {
-            .SUCCESS => if (poll_rc == 0) error.Timeout else poll_rc,
-            .INTR => continue,
-            .INVAL => error.TooManyPollFds,
-            .FAULT => |e| errno_bug("poll", e),
-            else => |e| record_unexpected_errno(unexpected, e),
+        return pollintr(io, fds, deadline, unexpected) catch |err| switch (err) {
+            error.Intr => continue,
+            else => |e| e,
         };
     }
+}
+
+pub fn pollintr(
+    io: Io,
+    fds: []linux.pollfd,
+    deadline: Clock.Timestamp,
+    unexpected: ?*linux.E,
+) (error{Intr} || PollError)!usize {
+    const timeout = timeout_remaining_ms(io, deadline) orelse return error.Timeout;
+    const poll_rc = linux.poll(fds.ptr, fds.len, timeout);
+    return switch (linux.errno(poll_rc)) {
+        .SUCCESS => if (poll_rc == 0) error.Timeout else poll_rc,
+        .INTR => error.Intr,
+        .INVAL => error.TooManyPollFds,
+        .FAULT => |e| errno_bug("poll", e),
+        else => |e| record_unexpected_errno(unexpected, e),
+    };
 }
 
 pub fn pollfd(fd: i32, events: i16) linux.pollfd {
