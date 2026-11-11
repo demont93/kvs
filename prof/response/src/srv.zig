@@ -105,7 +105,6 @@ pub const Report = struct {
 };
 
 pub const Message = enum(u8) {
-    end,
     ready,
 };
 
@@ -166,7 +165,7 @@ fn server(ctx: Context) !void {
     };
     defer serv.close();
 
-    sendReady(ctx.sock);
+    try sendReady(ctx.sock);
 
     var addr_buf: [15]u8 = undefined;
     const addr = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{}", .{ctx.port});
@@ -274,9 +273,9 @@ test "server closes" {
     };
     lib.closeFdLog(sock_pair[1]);
 
-    var buf :[1]u8 = undefined;
+    var buf: [1]u8 = undefined;
     try lib.recvAll(sock_pair[0], &buf);
-    try testing.expectEqual(Message.ready, @enumFromInt(buf[0]));
+    try testing.expectEqual(Message.ready, @as(Message, @enumFromInt(buf[0])));
 
     switch (errno(linux.kill(pid, .INT))) {
         .SUCCESS => {},
