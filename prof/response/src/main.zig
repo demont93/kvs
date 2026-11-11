@@ -16,3 +16,7 @@ pub fn main(init: std.process.Init) !void {
         .run => |inner| try runner.run(init.io, init.arena, inner, .{}),
     };
 }
+
+test {
+    _ = @import("runner.zig");
+}
