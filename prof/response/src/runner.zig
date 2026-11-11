@@ -383,7 +383,7 @@ const Perf = struct {
                         .id = child_pid,
                         .request_resource_usage_statistics = false,
                         .thread_handle = {},
-                        .stderr = Io.File.stderr(),
+                        .stderr = null,
                         .stdin = null,
                         .stdout = null,
                     };
@@ -485,7 +485,7 @@ const Perf = struct {
         self.child_proc.kill(io);
     }
 
-    fn enable(self: *Perf) !void {
+    fn enable(self: *Perf) Err!void {
         errdefer logErr("enabling perf\n", .{}) catch {};
         try self.send_msg("enable");
     }
@@ -862,7 +862,7 @@ const RunCmd = struct {
     op: load_gen.Op,
 };
 
-test "run a test" {
+test "happy path" {
     const run_cmd: RunCmd = .{
         .port = 9999,
         .cpu1 = 1,
@@ -873,6 +873,55 @@ test "run a test" {
         .op = .delete_hit,
     };
     try testRun(run_cmd, &basicFakeServ, &basicFakeLgen, &basicFakePerf, false);
+}
+
+test "perf is killed if it hangs after stop ack" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var perf = try Perf.record(
+        testing.io,
+        &arena,
+        34,
+        .{ .init = .{ .test_spawn = perfTestFunc(hangingFakePerf) } },
+    );
+
+    try perf.enable();
+    try perf.stop();
+    try testing.expectError(Err.Err, perf.wait(testing.io));
+}
+
+test "perf handle returns error if unexpected close" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var perf = try Perf.record(
+        testing.io,
+        &arena,
+        342,
+        .{ .init = .{ .test_spawn = perfTestFunc(unexpectedCloseFakePerf) } },
+    );
+    try perf.enable();
+    perf.stop() catch {
+        perf.kill(testing.io);
+        return;
+    };
+    try perf.wait(testing.io);
+}
+
+fn unexpectedCloseFakePerf(t: *PerfTester) !void {
+    try t.recvEnable();
+    try t.sendAck();
+    try t.recvStop();
+    return Err.Err;
+}
+
+fn hangingFakePerf(t: *PerfTester) !void {
+    try t.recvEnable();
+    try t.sendAck();
+    try t.recvStop();
+    try t.sendAck();
+    try testing.io.sleep(.fromSeconds(20), .awake);
 }
 
 fn basicFakeServ(arg: usize) callconv(.c) u8 {
@@ -925,6 +974,23 @@ fn basicFakeLgen(arg: usize) callconv(.c) u8 {
     return load_gen.ExitCode.success.value();
 }
 
+fn perfTestFunc(
+    comptime f: fn (*PerfTester) anyerror!void,
+) CloneTarget {
+    return struct {
+        fn do(arg: usize) callconv(.c) u8 {
+            var t: PerfTester = undefined;
+            t.init(arg);
+
+            if (f(&t)) |_| {
+                return 0;
+            } else |_| {
+                return 1;
+            }
+        }
+    }.do;
+}
+
 fn basicFakePerf(arg: usize) callconv(.c) u8 {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -973,8 +1039,6 @@ fn basicFakePerf(arg: usize) callconv(.c) u8 {
     return 0;
 }
 
-const CloneTarget = *const fn (arg: usize) callconv(.c) u8;
-
 fn testRun(
     cmd: anytype,
     fakeServFunc: CloneTarget,
@@ -1009,3 +1073,47 @@ fn testRun(
         );
     }
 }
+
+const CloneTarget = *const fn (arg: usize) callconv(.c) u8;
+
+const PerfTester = struct {
+    arena: ArenaAllocator,
+    ctl_pipe: Io.File,
+    ack_pipe: Io.File,
+    buf_r: [256]u8 = undefined,
+    buf_w: [256]u8 = undefined,
+    ctl_r: Io.File.Reader,
+    ack_w: Io.File.Writer,
+
+    fn init(self: *PerfTester, arg: usize) void {
+        const ctx: *Perf.TestCtx = @ptrFromInt(arg);
+        self.arena = std.heap.ArenaAllocator.init(testing.allocator);
+        self.ack_pipe = Io.File{ .flags = .{ .nonblocking = false }, .handle = ctx.ack_pipe };
+        self.ctl_pipe = Io.File{ .flags = .{ .nonblocking = false }, .handle = ctx.ctl_pipe };
+        self.ack_w = self.ack_pipe.writerStreaming(testing.io, &self.buf_w);
+        self.ctl_r = self.ctl_pipe.readerStreaming(testing.io, &self.buf_r);
+    }
+
+    fn close(self: *PerfTester) !void {
+        self.arena.deinit();
+        self.ack_pipe.close(testing.io);
+        self.ctl_pipe.close(testing.io);
+    }
+
+    fn sendAck(self: *PerfTester) !void {
+        try self.ack_w.interface.writeAll(Perf.ack);
+        try self.ack_w.interface.flush();
+    }
+
+    fn recvEnable(self: *PerfTester) !void {
+        var buf: [6]u8 = undefined;
+        try self.ctl_r.interface.readSliceAll(&buf);
+        try testing.expectEqualSlices(u8, "enable", &buf);
+    }
+
+    fn recvStop(self: *PerfTester) !void {
+        var buf: [4]u8 = undefined;
+        try self.ctl_r.interface.readSliceAll(&buf);
+        try testing.expectEqualSlices(u8, "stop", &buf);
+    }
+};
