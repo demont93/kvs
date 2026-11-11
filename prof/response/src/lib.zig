@@ -55,6 +55,62 @@ pub fn sendAll(fd: i32, buf: []const u8) RwError!void {
     }
 }
 
+fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) Err!i32 {
+    errdefer logErr("clone\n", .{}) catch {};
+
+    const stack = try makeStack();
+    defer destroyStack(stack);
+
+    const clone_rc = linux.clone(
+        f,
+        @intFromPtr(stack.ptr) + stack.len,
+        @intFromEnum(linux.SIG.CHLD),
+        @intFromPtr(arg),
+        null,
+        0,
+        null,
+    );
+
+    return switch (errno(clone_rc)) {
+        .SUCCESS => @intCast(clone_rc),
+        else => |e| errnoUnexpected("clone", e),
+    };
+}
+
+fn makeStack() Err![]u8 {
+    const mmap_rc = linux.mmap(
+        null,
+        1 << 20,
+        .{ .WRITE = true, .READ = true },
+        .{ .ANONYMOUS = true, .TYPE = .PRIVATE },
+        -1,
+        0,
+    );
+
+    return switch (errno(mmap_rc)) {
+        .SUCCESS => @as([*]u8, @ptrFromInt(mmap_rc))[0 .. 1 << 20],
+        .NOMEM => logErr("mmap: out of memory\n", .{}),
+        .AGAIN,
+        .BADF,
+        .EXIST,
+        .INVAL,
+        .NODEV,
+        .OVERFLOW,
+        .ACCES,
+        .PERM,
+        .TXTBSY,
+        => |e| errnoBug("mmap", e),
+        else => |e| errnoUnexpected("mmap", e),
+    };
+}
+
+fn destroyStack(stack: []u8) void {
+    switch (errno(linux.munmap(stack.ptr, stack.len))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("munmap", e),
+    }
+}
+
 pub fn errnoBug(call: []const u8, e: linux.E) noreturn {
     std.debug.panic("errno bug when calling {s}: {t}\n", .{ call, e });
 }

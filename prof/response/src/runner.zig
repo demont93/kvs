@@ -134,7 +134,7 @@ const ServerHandle = struct {
             .test_spawn => |v| v,
         };
 
-        const pid = clone(ctx, spawn_func) catch |e| {
+        const pid = lib.clone(ctx, spawn_func) catch |e| {
             closeFdLog(socks[0]);
             closeFdLog(socks[1]);
             return e;
@@ -222,7 +222,7 @@ const LoadGenHandle = struct {
             .test_spawn => |v| v,
         };
 
-        const pid = clone(ctx, spawn_func) catch |e| {
+        const pid = lib.clone(ctx, spawn_func) catch |e| {
             closeFdLog(socks[0]);
             closeFdLog(socks[1]);
             return e;
@@ -386,7 +386,7 @@ const Perf = struct {
                         .ack_pipe = pipe_pairs.their_w,
                         .ctl_pipe = pipe_pairs.their_r,
                     };
-                    const child_pid = try clone(@constCast(&ctx), v);
+                    const child_pid = try lib.clone(@constCast(&ctx), v);
                     break :blk process.Child{
                         .id = child_pid,
                         .request_resource_usage_statistics = false,
@@ -621,62 +621,6 @@ pub fn run(io: Io, arena: *ArenaAllocator, cmd: anytype, opts: RunOptions) Err!v
     }
 
     try runner.wait();
-}
-
-fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) Err!i32 {
-    errdefer logErr("clone\n", .{}) catch {};
-
-    const stack = try makeStack();
-    defer destroyStack(stack);
-
-    const clone_rc = linux.clone(
-        f,
-        @intFromPtr(stack.ptr) + stack.len,
-        @intFromEnum(linux.SIG.CHLD),
-        @intFromPtr(arg),
-        null,
-        0,
-        null,
-    );
-
-    return switch (errno(clone_rc)) {
-        .SUCCESS => @intCast(clone_rc),
-        else => |e| errnoUnexpected("clone", e),
-    };
-}
-
-fn makeStack() Err![]u8 {
-    const mmap_rc = linux.mmap(
-        null,
-        1 << 20,
-        .{ .WRITE = true, .READ = true },
-        .{ .ANONYMOUS = true, .TYPE = .PRIVATE },
-        -1,
-        0,
-    );
-
-    return switch (errno(mmap_rc)) {
-        .SUCCESS => @as([*]u8, @ptrFromInt(mmap_rc))[0 .. 1 << 20],
-        .NOMEM => logErr("mmap: out of memory\n", .{}),
-        .AGAIN,
-        .BADF,
-        .EXIST,
-        .INVAL,
-        .NODEV,
-        .OVERFLOW,
-        .ACCES,
-        .PERM,
-        .TXTBSY,
-        => |e| errnoBug("mmap", e),
-        else => |e| errnoUnexpected("mmap", e),
-    };
-}
-
-fn destroyStack(stack: []u8) void {
-    switch (errno(linux.munmap(stack.ptr, stack.len))) {
-        .SUCCESS => {},
-        else => |e| errnoBug("munmap", e),
-    }
 }
 
 fn closeFd(fd: i32) Err!void {
