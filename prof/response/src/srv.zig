@@ -6,10 +6,13 @@ const Io = std.Io;
 const assert = std.debug.assert;
 const linux = std.os.linux;
 const Err = lib.Err;
+const errno = linux.errno;
 
 const kvs = @import("kvs");
 
 const lib = @import("lib.zig");
+
+var process_ctx: ProcessCtx = undefined;
 
 const CountAllocator = struct {
     smp_alloc: SmpAllocator = .{},
@@ -88,8 +91,16 @@ const CountAllocator = struct {
     }
 };
 
+const ProcessCtx = struct {
+    count_allocator: *CountAllocator,
+    report: *Report,
+    state: enum { empty, before_measurement, after_measurement },
+};
+
 pub const Report = struct {
-    allocations: usize,
+    alloc_count: usize = 0,
+    remap_count: usize = 0,
+    resize_count: usize = 0,
 };
 
 pub const Message = enum(u8) {
@@ -100,7 +111,9 @@ pub const Message = enum(u8) {
 pub const Context = struct {
     cpu: linux.cpu_set_t,
     sock: i32,
+    port: u16,
     count_allocs: bool,
+    report: Report,
 };
 
 pub const ExitCode = enum(u8) {
@@ -122,6 +135,15 @@ pub fn processMain(arg: usize) callconv(.c) u8 {
 }
 
 fn server(ctx: Context) !void {
+    defer {
+        switch (errno(linux.close(ctx.sock))) {
+            .SUCCESS => {},
+            else => |e| lib.errnoUnexpected("close", e),
+        }
+    }
+
+    try linux.sched_setaffinity(0, &ctx.cpu);
+
     const smp_allocator = std.heap.smp;
     const counting_allocator = CountAllocator{};
 
@@ -135,14 +157,82 @@ fn server(ctx: Context) !void {
 
     const io = threaded.io();
 
-    try linux.sched_setaffinity(0, &ctx.cpu);
+    var report: Report = undefined;
+
+    if (ctx.count_allocs) {
+        installSigHandler(counting_allocator, &report);
+    }
 
     var serv: kvs.Server = undefined;
     serv.init(allocator, io, .{}) catch |err| return switch (err) {
         error.OutOfMemory => lib.logErr("out of memory initializing server\n", .{}),
     };
+    defer serv.close();
 
-    @panic("unimplemented");
+    var addr_buf: [15]u8 = undefined;
+    const addr = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{}", .{ctx.port});
+    serv.listen_and_serve(addr);
+
+    if (ctx.count_allocs) {
+        try sendReport(ctx.sock, &report);
+    }
+}
+
+/// Must be called only once per process.
+fn installSigHandler(count_allocator: *CountAllocator, report: *Report) void {
+    process_ctx.count_allocator = count_allocator;
+    process_ctx.report = report;
+    process_ctx.state = .empty;
+
+    const zeromask = linux.sigemptyset();
+    const usr_sigaction = linux.Sigaction{
+        .flags = 0,
+        .mask = zeromask,
+        .handler = .{ .handler = &snapshotAllocations },
+    };
+    sigaction(.USR1, &usr_sigaction);
+    sigaction(.USR2, &usr_sigaction);
+}
+
+fn sigaction(s: linux.SIG, sigact: *linux.Sigaction) void {
+    switch (errno(linux.sigaction(s, sigact, null))) {
+        .SUCCESS => {},
+        .FAULT, .INVAL => |e| lib.errnoBug("sigaction", e),
+    }
+}
+
+fn snapshotAllocations(s: linux.SIG) callconv(.c) void {
+    const a = &process_ctx.count_allocator;
+    const r = &process_ctx.report;
+
+    switch (s) {
+        .USR1 => {
+            if (process_ctx.state != .empty) {
+                std.process.abort();
+            }
+            process_ctx.state = .before_measurement;
+
+            r.alloc_count = a.alloc_count;
+            r.remap_count = a.remap_count;
+            r.resize_count = a.resize_count;
+        },
+        .USR2 => {
+            if (process_ctx.state != .before_measurement) {
+                std.process.abort();
+            }
+            process_ctx.state = .after_measurement;
+
+            r.alloc_count = a.alloc_count - r.alloc_count;
+            r.remap_count = a.remap_count - r.remap_count;
+            r.resize_count = a.resize_count - r.resize_count;
+        },
+        else => unreachable,
+    }
+}
+
+fn sendReport(sock: i32, report: *const Report) !void {
+    const report_buf: *const [@sizeOf(Report)]u8 = @ptrCast(&report);
+    try lib.sendAll(sock, report_buf);
 }
 
 fn recvEnd(sock: i32) !void {

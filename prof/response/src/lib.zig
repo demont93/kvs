@@ -55,7 +55,7 @@ pub fn sendAll(fd: i32, buf: []const u8) RwError!void {
     }
 }
 
-fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) Err!i32 {
+pub fn clone(arg: ?*anyopaque, f: *const fn (usize) callconv(.c) u8) Err!i32 {
     errdefer logErr("clone\n", .{}) catch {};
 
     const stack = try makeStack();
