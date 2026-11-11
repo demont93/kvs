@@ -126,7 +126,7 @@ const ServerHandle = struct {
     fn init(ctx: *srv.Context, opts: InitOptions) Err!ServerHandle {
         errdefer logErr("opening server\n", .{}) catch {};
 
-        const socks = try socketPair();
+        const socks = try lib.socketPair();
         ctx.sock = socks[0];
 
         const spawn_func = switch (opts.init) {
@@ -214,7 +214,7 @@ const LoadGenHandle = struct {
     fn init(ctx: *load_gen.Context, opts: InitOptions) Err!LoadGenHandle {
         errdefer logErr("opening load generator\n", .{}) catch {};
 
-        const socks = try socketPair();
+        const socks = try lib.socketPair();
         ctx.sock = socks[0];
 
         const spawn_func = switch (opts.init) {
@@ -329,8 +329,8 @@ const Perf = struct {
         }
 
         fn noCloExecTheirs(self: PipePairs) Err!void {
-            try noCloexec(self.their_r);
-            try noCloexec(self.their_w);
+            try lib.noCloexec(self.their_r);
+            try lib.noCloexec(self.their_w);
         }
 
         fn closeLogMine(self: *PipePairs) void {
@@ -565,25 +565,6 @@ const Perf = struct {
 
         return fds;
     }
-
-    fn noCloexec(fd: i32) Err!void {
-        var flags: usize = @intCast(try getFdFlags(fd));
-        flags &= ~@as(usize, linux.FD_CLOEXEC);
-        return switch (errno(linux.fcntl(fd, linux.F.SETFD, flags))) {
-            .SUCCESS => {},
-            .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
-            else => |e| errnoUnexpected("fcntl", e),
-        };
-    }
-
-    fn getFdFlags(fd: i32) Err!i32 {
-        const f_rc = linux.fcntl(fd, linux.F.GETFD, 0);
-        return switch (errno(f_rc)) {
-            .SUCCESS => @as(i32, @intCast(f_rc)),
-            .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
-            else => |e| errnoUnexpected("fcntl", e),
-        };
-    }
 };
 
 const RunOptions = struct {
@@ -634,21 +615,6 @@ fn closeFd(fd: i32) Err!void {
 
 fn closeFdLog(fd: i32) void {
     closeFd(fd) catch {};
-}
-
-fn socketPair() Err![2]i32 {
-    var socks: [2]i32 = undefined;
-
-    try switch (errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks))) {
-        .SUCCESS => {},
-        .OPNOTSUPP,
-        .PROTONOSUPPORT,
-        .AFNOSUPPORT,
-        => |e| errnoBug("socketpair", e),
-        else => |e| errnoUnexpected("socketpair", e),
-    };
-
-    return socks;
 }
 
 fn waitHandle(pid: *i32, sock_fd: *i32) Err!u8 {

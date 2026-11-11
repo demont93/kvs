@@ -111,6 +111,40 @@ fn destroyStack(stack: []u8) void {
     }
 }
 
+pub fn socketPair() Err![2]i32 {
+    var socks: [2]i32 = undefined;
+
+    try switch (errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks))) {
+        .SUCCESS => {},
+        .OPNOTSUPP,
+        .PROTONOSUPPORT,
+        .AFNOSUPPORT,
+        => |e| errnoBug("socketpair", e),
+        else => |e| errnoUnexpected("socketpair", e),
+    };
+
+    return socks;
+}
+
+pub fn noCloexec(fd: i32) Err!void {
+    var flags: usize = @intCast(try getFdFlags(fd));
+    flags &= ~@as(usize, linux.FD_CLOEXEC);
+    return switch (errno(linux.fcntl(fd, linux.F.SETFD, flags))) {
+        .SUCCESS => {},
+        .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
+        else => |e| errnoUnexpected("fcntl", e),
+    };
+}
+
+fn getFdFlags(fd: i32) Err!i32 {
+    const f_rc = linux.fcntl(fd, linux.F.GETFD, 0);
+    return switch (errno(f_rc)) {
+        .SUCCESS => @as(i32, @intCast(f_rc)),
+        .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
+        else => |e| errnoUnexpected("fcntl", e),
+    };
+}
+
 pub fn errnoBug(call: []const u8, e: linux.E) noreturn {
     std.debug.panic("errno bug when calling {s}: {t}\n", .{ call, e });
 }
