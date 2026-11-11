@@ -7,6 +7,7 @@ const assert = std.debug.assert;
 const linux = std.os.linux;
 const Err = lib.Err;
 const errno = linux.errno;
+const testing = std.testing;
 
 const kvs = @import("kvs");
 
@@ -15,7 +16,7 @@ const lib = @import("lib.zig");
 var process_ctx: ProcessCtx = undefined;
 
 const CountAllocator = struct {
-    smp_alloc: SmpAllocator = .{},
+    smp_alloc: Allocator = std.heap.smp_allocator,
     alloc_count: usize = 0,
     remap_count: usize = 0,
     resize_count: usize = 0,
@@ -41,7 +42,7 @@ const CountAllocator = struct {
         ret_addr: usize,
     ) ?[*]u8 {
         var self: *CountAllocator = @ptrCast(@alignCast(context));
-        const res = SmpAllocator.vtable.alloc(&self.smp_alloc, len, alignment, ret_addr);
+        const res = SmpAllocator.vtable.alloc(self.smp_alloc.ptr, len, alignment, ret_addr);
         if (res != null) {
             self.alloc_count += 1;
         }
@@ -57,7 +58,7 @@ const CountAllocator = struct {
     ) ?[*]u8 {
         var self: *CountAllocator = @ptrCast(@alignCast(context));
         const res = SmpAllocator.vtable.remap(
-            &self.smp_alloc,
+            self.smp_alloc.ptr,
             memory,
             alignment,
             new_len,
@@ -78,7 +79,7 @@ const CountAllocator = struct {
     ) bool {
         var self: *CountAllocator = @ptrCast(@alignCast(context));
         const res = SmpAllocator.vtable.resize(
-            &self.smp_alloc,
+            self.smp_alloc.ptr,
             memory,
             alignment,
             new_len,
@@ -104,16 +105,15 @@ pub const Report = struct {
 };
 
 pub const Message = enum(u8) {
-    start_counting,
     end,
+    ready,
 };
 
 pub const Context = struct {
-    cpu: linux.cpu_set_t,
+    cpu: ?linux.cpu_set_t,
     sock: i32,
     port: u16,
     count_allocs: bool,
-    report: Report,
 };
 
 pub const ExitCode = enum(u8) {
@@ -126,8 +126,8 @@ pub const ExitCode = enum(u8) {
 };
 
 pub fn processMain(arg: usize) callconv(.c) u8 {
-    const ctx: Context = @ptrFromInt(arg);
-    if (server(ctx)) |_| {
+    const ctx: *Context = @ptrFromInt(arg);
+    if (server(ctx.*)) |_| {
         return ExitCode.success.value();
     } else |_| {
         return ExitCode.success.value();
@@ -135,24 +135,21 @@ pub fn processMain(arg: usize) callconv(.c) u8 {
 }
 
 fn server(ctx: Context) !void {
-    defer {
-        switch (errno(linux.close(ctx.sock))) {
-            .SUCCESS => {},
-            else => |e| lib.errnoUnexpected("close", e),
-        }
+    defer lib.closeFdLog(ctx.sock);
+
+    if (ctx.cpu) |*cpu| {
+        try linux.sched_setaffinity(0, cpu);
     }
 
-    try linux.sched_setaffinity(0, &ctx.cpu);
-
-    const smp_allocator = std.heap.smp;
-    const counting_allocator = CountAllocator{};
+    const smp_allocator = std.heap.smp_allocator;
+    var counting_allocator = CountAllocator{};
 
     const allocator = if (ctx.count_allocs)
         counting_allocator.allocator()
     else
         smp_allocator;
 
-    const threaded = std.Io.Threaded.init(smp_allocator, .{});
+    var threaded = std.Io.Threaded.init(smp_allocator, .{});
     defer threaded.deinit();
 
     const io = threaded.io();
@@ -160,7 +157,7 @@ fn server(ctx: Context) !void {
     var report: Report = undefined;
 
     if (ctx.count_allocs) {
-        installSigHandler(counting_allocator, &report);
+        installSigHandler(&counting_allocator, &report);
     }
 
     var serv: kvs.Server = undefined;
@@ -168,6 +165,8 @@ fn server(ctx: Context) !void {
         error.OutOfMemory => lib.logErr("out of memory initializing server\n", .{}),
     };
     defer serv.close();
+
+    sendReady(ctx.sock);
 
     var addr_buf: [15]u8 = undefined;
     const addr = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{}", .{ctx.port});
@@ -194,16 +193,16 @@ fn installSigHandler(count_allocator: *CountAllocator, report: *Report) void {
     sigaction(.USR2, &usr_sigaction);
 }
 
-fn sigaction(s: linux.SIG, sigact: *linux.Sigaction) void {
+fn sigaction(s: linux.SIG, sigact: *const linux.Sigaction) void {
     switch (errno(linux.sigaction(s, sigact, null))) {
         .SUCCESS => {},
-        .FAULT, .INVAL => |e| lib.errnoBug("sigaction", e),
+        else => |e| lib.errnoBug("sigaction", e),
     }
 }
 
 fn snapshotAllocations(s: linux.SIG) callconv(.c) void {
-    const a = &process_ctx.count_allocator;
-    const r = &process_ctx.report;
+    const a = process_ctx.count_allocator;
+    const r = process_ctx.report;
 
     switch (s) {
         .USR1 => {
@@ -235,6 +234,10 @@ fn sendReport(sock: i32, report: *const Report) !void {
     try lib.sendAll(sock, report_buf);
 }
 
+fn sendReady(sock: i32) !void {
+    try lib.sendAll(sock, &[_]u8{@intFromEnum(Message.ready)});
+}
+
 fn recvEnd(sock: i32) !void {
     var buf: [1]u8 = undefined;
     recvAll(sock, &buf) catch |err| return switch (err) {
@@ -252,4 +255,35 @@ fn recvAll(sock: i32, buf: []u8) (error{UnexpectedEof} || Err)!void {
         error.Unexpected => Err.Err,
         error.ClosedByPeer => lib.logErr("connection closed\n", .{}),
     };
+}
+
+test "server closes" {
+    const sock_pair = try lib.socketPair();
+    defer lib.closeFdLog(sock_pair[0]);
+
+    const pid = blk: {
+        errdefer lib.closeFdLog(sock_pair[1]);
+        try lib.noCloexec(sock_pair[1]);
+        const ctx: Context = .{
+            .count_allocs = false,
+            .cpu = null,
+            .port = 0,
+            .sock = sock_pair[1],
+        };
+        break :blk try lib.clone(@constCast(&ctx), processMain);
+    };
+    lib.closeFdLog(sock_pair[1]);
+
+    var buf :[1]u8 = undefined;
+    try lib.recvAll(sock_pair[0], &buf);
+    try testing.expectEqual(Message.ready, @enumFromInt(buf[0]));
+
+    switch (errno(linux.kill(pid, .INT))) {
+        .SUCCESS => {},
+        .SRCH => |e| return lib.errnoUnexpected("kill", e),
+        else => |e| lib.errnoBug("kill", e),
+    }
+
+    const exit_code = try lib.waitChild(pid);
+    try testing.expectEqual(1, exit_code);
 }

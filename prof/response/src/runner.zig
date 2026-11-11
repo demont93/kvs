@@ -74,7 +74,7 @@ const Runner = struct {
 
             try perf.enable();
             try self.lg_handle.start();
-            try self.server_handle.start();
+            // try self.server_handle.start();
 
             _ = try poll(&poll_fds);
 
@@ -83,6 +83,7 @@ const Runner = struct {
             try self.lg_handle.awaitDone();
 
             try self.server_handle.awaitResult(&report);
+            @panic("unimplemented");
         }
 
         try perf.wait(io);
@@ -580,6 +581,8 @@ pub fn run(io: Io, arena: *ArenaAllocator, cmd: anytype, opts: RunOptions) Err!v
     var server_ctx: srv.Context = .{
         .cpu = try cpuNSet(cmd.cpu1),
         .sock = undefined,
+        .count_allocs = false,
+        .port = cmd.port,
     };
 
     var lg_ctx: load_gen.Context = .{
@@ -754,7 +757,11 @@ fn basicFakeServ(arg: usize) callconv(.c) u8 {
 
     const end_msg: [1]u8 = .{@intFromEnum(srv.Message.end)};
 
-    const report = srv.Report{ .allocations = 234 };
+    const report = srv.Report{
+        .alloc_count = 234,
+        .remap_count = 234,
+        .resize_count = 234,
+    };
     const result_msg: *const [@sizeOf(srv.Report)]u8 = @ptrCast(&report);
 
     var buf: [1]u8 = undefined;
