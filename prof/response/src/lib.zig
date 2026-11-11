@@ -126,6 +126,16 @@ pub fn socketPair() Err![2]i32 {
     return socks;
 }
 
+pub fn cloexec(fd: i32) Err!void {
+    var flags: usize = @intCast(try getFdFlags(fd));
+    flags |= @as(usize, linux.FD_CLOEXEC);
+    return switch (errno(linux.fcntl(fd, linux.F.SETFD, flags))) {
+        .SUCCESS => {},
+        .BADF, .FAULT, .INVAL => |e| errnoBug("fcntl", e),
+        else => |e| errnoUnexpectedErr("fcntl", e),
+    };
+}
+
 pub fn noCloexec(fd: i32) Err!void {
     var flags: usize = @intCast(try getFdFlags(fd));
     flags &= ~@as(usize, linux.FD_CLOEXEC);
