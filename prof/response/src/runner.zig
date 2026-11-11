@@ -9,10 +9,12 @@ const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
 
+const lib = @import("lib.zig");
+const errnoBug = lib.errnoBug;
+const logErr = lib.logErr;
+const Err = lib.Err;
 const load_gen = @import("load_gen.zig");
 const srv = @import("srv.zig");
-
-const Err = error{Err};
 
 const Runner = struct {
     // fd numbers
@@ -72,6 +74,7 @@ const Runner = struct {
 
             try perf.enable();
             try self.lg_handle.start();
+            try self.server_handle.start();
 
             _ = try poll(&poll_fds);
 
@@ -179,6 +182,11 @@ const ServerHandle = struct {
     fn end(self: *ServerHandle) Err!void {
         self.status = .done;
         const msg = @intFromEnum(srv.Message.end);
+        try sendAll(self.sock, @as(*const [1]u8, &msg));
+    }
+
+    fn startCounting(self: *ServerHandle) Err!void {
+        const msg = @intFromEnum(srv.Message.start_counting);
         try sendAll(self.sock, @as(*const [1]u8, &msg));
     }
 
@@ -762,24 +770,10 @@ fn killChild(pid: i32) void {
 }
 
 fn sendAll(fd: i32, buf: []const u8) Err!void {
-    var n_written: usize = 0;
-    while (n_written < buf.len) {
-        const write_rc = linux.write(fd, buf.ptr + n_written, buf.len - n_written);
-
-        const n = try switch (errno(write_rc)) {
-            .SUCCESS => write_rc,
-            .INTR => continue,
-            .INVAL,
-            .AGAIN,
-            .BADF,
-            .NOTSOCK,
-            => |e| errnoBug("write", e),
-            .CONNRESET, .PIPE => logErr("connection closed by peer\n", .{}),
-            else => |e| errnoUnexpected("write", e),
-        };
-
-        n_written += n;
-    }
+    lib.sendAll(fd, buf) catch |err| return switch (err) {
+        error.Unexpected => Err.Err,
+        error.ClosedByPeer => logErr("connection closed by peer\n", .{}),
+    };
 }
 
 const ReadAllError = error{
@@ -787,24 +781,11 @@ const ReadAllError = error{
 } || Err;
 
 fn recvAll(fd: i32, buf: []u8) ReadAllError!void {
-    var n_read: usize = 0;
-    while (n_read < buf.len) {
-        const read_rc = linux.read(fd, buf[n_read..].ptr, buf.len - n_read);
-        const n = try switch (errno(read_rc)) {
-            .SUCCESS => if (read_rc == 0) ReadAllError.UnexpectedEof else read_rc,
-            .INTR => continue,
-            .PIPE, .CONNRESET => logErr("connection reset by peer\n", .{}),
-            .AGAIN,
-            .BADF,
-            .FAULT,
-            .INVAL,
-            .ISDIR,
-            .NOTSOCK,
-            => |e| errnoBug("read", e),
-            else => |e| errnoUnexpected("read", e),
-        };
-        n_read += n;
-    }
+    return lib.recvAll(fd, buf) catch |err| switch (err) {
+        error.ClosedByPeer => logErr("connection reset by peer\n", .{}),
+        error.Unexpected => Err.Err,
+        error.UnexpectedEof => |e| e,
+    };
 }
 
 fn cpuNSet(n: i32) Err!linux.cpu_set_t {
@@ -829,18 +810,8 @@ fn setCpuset(set: *linux.cpu_set_t, n: i32) Err!void {
     set[index] |= mask;
 }
 
-fn errnoBug(call: []const u8, e: linux.E) noreturn {
-    std.debug.panic("errno bug when calling {s}: {t}\n", .{ call, e });
-}
-
 fn errnoUnexpected(call: []const u8, e: linux.E) Err {
-    std.debug.print("unexpected errno when calling {s}: {t}\n", .{ call, e });
-    return Err.Err;
-}
-
-fn logErr(comptime fmt: []const u8, args: anytype) Err {
-    std.debug.print(fmt, args);
-    return Err.Err;
+    lib.errnoUnexpected(call, e) catch return Err.Err;
 }
 
 test "setCpuset" {

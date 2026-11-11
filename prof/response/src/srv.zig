@@ -5,6 +5,11 @@ const SmpAllocator = std.heap.SmpAllocator;
 const Io = std.Io;
 const assert = std.debug.assert;
 const linux = std.os.linux;
+const Err = lib.Err;
+
+const kvs = @import("kvs");
+
+const lib = @import("lib.zig");
 
 const CountAllocator = struct {
     smp_alloc: SmpAllocator = .{},
@@ -88,12 +93,14 @@ pub const Report = struct {
 };
 
 pub const Message = enum(u8) {
+    start_counting,
     end,
 };
 
 pub const Context = struct {
     cpu: linux.cpu_set_t,
     sock: i32,
+    count_allocs: bool,
 };
 
 pub const ExitCode = enum(u8) {
@@ -105,7 +112,54 @@ pub const ExitCode = enum(u8) {
     }
 };
 
-pub fn processMain(ctx: usize) callconv(.c) u8 {
-    _ = ctx;
+pub fn processMain(arg: usize) callconv(.c) u8 {
+    const ctx: Context = @ptrFromInt(arg);
+    if (server(ctx)) |_| {
+        return ExitCode.success.value();
+    } else |_| {
+        return ExitCode.success.value();
+    }
+}
+
+fn server(ctx: Context) !void {
+    const smp_allocator = std.heap.smp;
+    const counting_allocator = CountAllocator{};
+
+    const allocator = if (ctx.count_allocs)
+        counting_allocator.allocator()
+    else
+        smp_allocator;
+
+    const threaded = std.Io.Threaded.init(smp_allocator, .{});
+    defer threaded.deinit();
+
+    const io = threaded.io();
+
+    try linux.sched_setaffinity(0, &ctx.cpu);
+
+    var serv: kvs.Server = undefined;
+    serv.init(allocator, io, .{}) catch |err| return switch (err) {
+        error.OutOfMemory => lib.logErr("out of memory initializing server\n", .{}),
+    };
+
     @panic("unimplemented");
+}
+
+fn recvEnd(sock: i32) !void {
+    var buf: [1]u8 = undefined;
+    recvAll(sock, &buf) catch |err| return switch (err) {
+        error.UnexpectedEof => lib.logErr("unexpected eof expecting start\n", .{}),
+        error.Err => error.Err,
+    };
+    if (buf[0] != @intFromEnum(Message.end)) {
+        return lib.logErr("received invalid message expecting start: {}\n", .{buf[0]});
+    }
+}
+
+fn recvAll(sock: i32, buf: []u8) (error{UnexpectedEof} || Err)!void {
+    lib.recvAll(sock, &buf) catch |err| return switch (err) {
+        error.UnexpectedEof => error.UnexpectedEof,
+        error.Unexpected => Err.Err,
+        error.ClosedByPeer => lib.logErr("connection closed\n", .{}),
+    };
 }
