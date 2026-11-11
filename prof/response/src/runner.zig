@@ -755,7 +755,34 @@ fn hangingFakePerf(t: *PerfTester) !void {
 fn basicFakeServ(arg: usize) callconv(.c) u8 {
     const ctx: *srv.Context = @ptrFromInt(arg);
 
-    const end_msg: [1]u8 = .{@intFromEnum(srv.Message.end)};
+    var restore_sigset: linux.sigset_t = undefined;
+    var sigset = linux.sigemptyset();
+    linux.sigaddset(&sigset, .INT);
+
+    switch (errno(linux.sigprocmask(linux.SIG.BLOCK, &sigset, &restore_sigset))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("sigprocmask", e),
+    }
+
+    sendAll(ctx.sock, &[_]u8{@intFromEnum(srv.Message.ready)}) catch {
+        return srv.ExitCode.err.value();
+    };
+
+    switch (errno(linux.syscall4(
+        .rt_sigtimedwait,
+        @intFromPtr(&sigset),
+        0,
+        0,
+        @sizeOf(linux.sigset_t),
+    ))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("sigtimedwait", e),
+    }
+
+    switch (errno(linux.sigprocmask(linux.SIG.SETMASK, &restore_sigset, null))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("sigprocmask", e),
+    }
 
     const report = srv.Report{
         .alloc_count = 234,
@@ -763,15 +790,6 @@ fn basicFakeServ(arg: usize) callconv(.c) u8 {
         .resize_count = 234,
     };
     const result_msg: *const [@sizeOf(srv.Report)]u8 = @ptrCast(&report);
-
-    var buf: [1]u8 = undefined;
-    recvAll(ctx.sock, &buf) catch {
-        return srv.ExitCode.err.value();
-    };
-
-    testing.expectEqualSlices(u8, &end_msg, &buf) catch {
-        return srv.ExitCode.err.value();
-    };
 
     sendAll(ctx.sock, result_msg) catch {
         return srv.ExitCode.err.value();
