@@ -16,34 +16,66 @@ const Err = lib.Err;
 const load_gen = @import("load_gen.zig");
 const srv = @import("srv.zig");
 
-const Runner = struct {
-    // fd numbers
+pub const Run = struct {
+    requests: usize,
+    key_count: usize,
+    seed: usize,
+    cpu1: i32,
+    cpu2: i32,
+    port: u16,
+    ops: Ops,
+};
+
+pub const Ops = std.EnumSet(load_gen.Op);
+
+const MeasurementType = enum {
+    profile,
+    count,
+};
+
+const Measurement = struct {
+    // fd slot numbers
     const fd_lgen = 0;
     const fd_serv = 1;
     const fd_perf = 2;
 
     server_handle: ServerHandle,
     lg_handle: LoadGenHandle,
+    measurement_type: MeasurementType,
+
+    const Options = struct {
+        port: u16,
+        cpu1: linux.cpu_set_t,
+        cpu2: linux.cpu_set_t,
+        measurement_type: MeasurementType,
+        workload: load_gen.Workload,
+        lgen_init: InitOptions,
+        serv_init: InitOptions,
+        perf_init: InitOptions,
+    };
 
     fn init(
-        self: *Runner,
-        server_ctx: *srv.Context,
-        lg_ctx: *load_gen.Context,
-        lgen_opts: InitOptions,
-        serv_opts: InitOptions,
+        self: *Measurement,
+        opts: Options,
     ) Err!void {
-        errdefer logErr("initializing runner\n", .{}) catch {};
+        errdefer logErr("initializing measurement execution\n", .{}) catch {};
 
-        self.lg_handle = try LoadGenHandle.init(lg_ctx, lgen_opts);
+        self.measurement_type = opts.measurement_type;
+        self.lg_handle = try LoadGenHandle.init(opts.cpu1, opts.workload, opts.lgen_init);
 
-        self.server_handle = ServerHandle.init(server_ctx, serv_opts) catch |e| {
+        self.server_handle = ServerHandle.init(
+            opts.port,
+            opts.cpu2,
+            opts.measurement_type,
+            opts.serv_init,
+        ) catch |e| {
             self.lg_handle.kill();
             return e;
         };
     }
 
-    fn wait(self: *Runner) Err!void {
-        errdefer logErr("waiting for runner children\n", .{}) catch {};
+    fn wait(self: *Measurement) Err!void {
+        errdefer logErr("waiting for measurement children\n", .{}) catch {};
 
         const lgen_result = self.lg_handle.wait();
         const serv_result = self.server_handle.close();
@@ -52,17 +84,23 @@ const Runner = struct {
         try serv_result;
     }
 
-    fn kill(self: *Runner) void {
-        logErr("killing runner children\n", .{}) catch {};
+    fn kill(self: *Measurement) void {
+        logErr("killing test children\n", .{}) catch {};
         self.lg_handle.kill();
         self.server_handle.close() catch {};
     }
 
-    fn profile(self: *Runner, io: Io, arena: *ArenaAllocator, perf_opts: InitOptions) !void {
-        errdefer logErr("running profile on runner\n", .{}) catch {};
+    fn run(self: *Measurement, io: Io, arena: *ArenaAllocator, perf_opts: InitOptions) !void {
+        errdefer logErr("{t} measurement failed\n", .{self.measurement_type}) catch {};
 
         var report: srv.Report = undefined;
-        var perf = try Perf.record(io, arena, self.server_handle.pid, perf_opts);
+
+        const perf_op: Perf.Op = switch (self.measurement_type) {
+            .count => .trace,
+            .profile => .record,
+        };
+
+        var perf = try Perf.init(io, arena, self.server_handle.pid, perf_op, perf_opts);
 
         {
             errdefer perf.kill(io);
@@ -71,25 +109,27 @@ const Runner = struct {
             self.initPollFds(perf, &poll_fds);
 
             try self.lg_handle.awaitReady();
+            try self.server_handle.awaitReady();
 
             try perf.enable();
             try self.lg_handle.start();
-            // try self.server_handle.start();
 
             _ = try poll(&poll_fds);
 
             try perf.stop();
-            try self.server_handle.end();
+            self.server_handle.end();
             try self.lg_handle.awaitDone();
 
-            try self.server_handle.awaitResult(&report);
-            @panic("unimplemented");
+            switch (self.measurement_type) {
+                .profile => {},
+                .count => try self.server_handle.awaitResult(&report),
+            }
         }
 
         try perf.wait(io);
     }
 
-    fn initPollFds(self: Runner, perf: Perf, poll_fds: *[3]linux.pollfd) void {
+    fn initPollFds(self: Measurement, perf: Perf, poll_fds: *[3]linux.pollfd) void {
         poll_fds[fd_lgen].fd = self.lg_handle.sock;
         poll_fds[fd_serv].fd = self.server_handle.sock;
         poll_fds[fd_perf].fd = perf.ack_pipe;
@@ -110,6 +150,24 @@ const Runner = struct {
             };
         }
     }
+
+    fn writeAllocationsReport(self: Measurement, report: srv.Report) Err!void {
+        
+    }
+
+
+    fn measure(io: Io, arena: *ArenaAllocator, opts: Measurement.Options) Err!void {
+        var measurement: Measurement = undefined;
+
+        try measurement.init(opts);
+
+        {
+            errdefer measurement.kill();
+            try measurement.run(io, arena, opts.perf_init);
+        }
+
+        try measurement.wait();
+    }
 };
 
 const InitOptions = struct {
@@ -122,32 +180,47 @@ const InitOptions = struct {
 const ServerHandle = struct {
     pid: i32,
     sock: i32,
+    measurement_type: MeasurementType,
     status: enum { running, done, unknown } = .running,
 
-    fn init(ctx: *srv.Context, opts: InitOptions) Err!ServerHandle {
+    fn init(
+        port: u16,
+        cpu: linux.cpu_set_t,
+        test_type: MeasurementType,
+        opts: InitOptions,
+    ) Err!ServerHandle {
         errdefer logErr("opening server\n", .{}) catch {};
 
         const socks = try lib.socketPair();
-        ctx.sock = socks[0];
+
+        const ctx: srv.Context = .{
+            .count_allocs = switch (test_type) {
+                .count => true,
+                .profile => false,
+            },
+            .cpu = cpu,
+            .port = port,
+            .sock = socks[1],
+        };
 
         const spawn_func = switch (opts.init) {
             .default => &srv.processMain,
             .test_spawn => |v| v,
         };
 
-        const pid = lib.clone(ctx, spawn_func) catch |e| {
+        const pid = lib.clone(@constCast(&ctx), spawn_func) catch |e| {
             lib.closeFdLog(socks[0]);
             lib.closeFdLog(socks[1]);
             return e;
         };
 
-        lib.closeFd(socks[0]) catch |e| {
+        lib.closeFd(socks[1]) catch |e| {
             lib.closeFdLog(socks[0]);
             lib.killChild(pid);
             return e;
         };
 
-        return ServerHandle{ .pid = pid, .sock = socks[1] };
+        return ServerHandle{ .pid = pid, .sock = socks[0], .measurement_type = .profile };
     }
 
     fn close(self: *ServerHandle) Err!void {
@@ -158,6 +231,21 @@ const ServerHandle = struct {
             .done => self.wait(),
             .unknown => self.kill(),
         };
+    }
+
+    fn awaitReady(self: *ServerHandle) Err!void {
+        errdefer logErr("awaiting ready\n", .{}) catch {};
+        var buf: [1]u8 = undefined;
+        recvAll(self.sock, &buf) catch |err| {
+            switch (err) {
+                error.UnexpectedEof => self.status = .done,
+                error.Err => self.status = .unknown,
+            }
+            return error.Err;
+        };
+        if (buf[0] != @intFromEnum(srv.Message.ready)) {
+            return logErr("received wrong message\n", .{});
+        }
     }
 
     fn awaitResult(self: *ServerHandle, report: *srv.Report) Err!void {
@@ -173,17 +261,16 @@ const ServerHandle = struct {
     }
 
     fn endWait(self: *ServerHandle) Err!void {
-        self.end() catch {
-            self.kill();
-            return;
-        };
+        self.end();
         try self.wait();
     }
 
-    fn end(self: *ServerHandle) Err!void {
+    fn end(self: *ServerHandle) void {
         self.status = .done;
-        const msg = @intFromEnum(srv.Message.end);
-        try sendAll(self.sock, @as(*const [1]u8, &msg));
+        switch (errno(linux.kill(self.pid, .INT))) {
+            .SUCCESS => {},
+            else => |e| errnoBug("kill", e),
+        }
     }
 
     fn startCounting(self: *ServerHandle) Err!void {
@@ -212,30 +299,39 @@ const LoadGenHandle = struct {
     pid: i32,
     sock: i32,
 
-    fn init(ctx: *load_gen.Context, opts: InitOptions) Err!LoadGenHandle {
+    fn init(
+        cpu: linux.cpu_set_t,
+        workload: load_gen.Workload,
+        opts: InitOptions,
+    ) Err!LoadGenHandle {
         errdefer logErr("opening load generator\n", .{}) catch {};
 
         const socks = try lib.socketPair();
-        ctx.sock = socks[0];
+
+        const ctx: load_gen.Context = .{
+            .cpu = cpu,
+            .sock = socks[1],
+            .workload = workload,
+        };
 
         const spawn_func = switch (opts.init) {
             .default => &load_gen.processMain,
             .test_spawn => |v| v,
         };
 
-        const pid = lib.clone(ctx, spawn_func) catch |e| {
+        const pid = lib.clone(@constCast(&ctx), spawn_func) catch |e| {
             lib.closeFdLog(socks[0]);
             lib.closeFdLog(socks[1]);
             return e;
         };
 
-        lib.closeFd(socks[0]) catch |e| {
+        lib.closeFd(socks[1]) catch |e| {
             lib.closeFdLog(socks[1]);
             lib.killChild(pid);
             return e;
         };
 
-        return LoadGenHandle{ .sock = socks[1], .pid = pid };
+        return LoadGenHandle{ .sock = socks[0], .pid = pid };
     }
 
     fn awaitDone(self: *LoadGenHandle) Err!void {
@@ -334,7 +430,7 @@ const Perf = struct {
             try lib.noCloexec(self.their_w);
         }
 
-        fn closeLogMine(self: *PipePairs) void {
+        fn closeMineLog(self: *PipePairs) void {
             lib.closeFdLog(self.my_r);
             lib.closeFdLog(self.my_w);
         }
@@ -353,11 +449,24 @@ const Perf = struct {
         ctl_pipe: i32,
     };
 
-    fn record(io: Io, arena: *ArenaAllocator, pid: i32, opts: InitOptions) Err!Perf {
-        errdefer logErr("recording with perf\n", .{}) catch {};
+    const Op = enum { record, trace };
+
+    fn init(
+        io: Io,
+        arena: *ArenaAllocator,
+        pid: i32,
+        op: Op,
+        opts: InitOptions,
+    ) Err!Perf {
+        errdefer {
+            switch (op) {
+                .trace => logErr("tracing with perf\n", .{}) catch {},
+                .record => logErr("recording with perf\n", .{}) catch {},
+            }
+        }
 
         var pipe_pairs: PipePairs = try .init();
-        errdefer pipe_pairs.closeLogMine();
+        errdefer pipe_pairs.closeMineLog();
 
         const child: process.Child = blk: {
             errdefer pipe_pairs.closeTheirs() catch {};
@@ -366,19 +475,17 @@ const Perf = struct {
 
             switch (opts.init) {
                 .default => {
-                    const argv = [_][]const u8{
-                        "perf",
-                        "record",
-                        "-g",
-                        "-e",
-                        "cycles",
-                        "-p",
-                        try pidStr(arena, pid),
-                        "--delay=-1",
-                        try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
+                    const args = switch (op) {
+                        .record => recordArgs(
+                            try pidStr(arena, pid),
+                            try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
+                        ),
+                        .trace => traceArgs(
+                            try pidStr(arena, pid),
+                            try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
+                        ),
                     };
-
-                    break :blk process.spawn(io, .{ .argv = &argv }) catch |err| switch (err) {
+                    break :blk process.spawn(io, .{ .argv = args }) catch |err| switch (err) {
                         else => |e| return logErr("failed to spawn perf: {t}\n", .{e}),
                     };
                 },
@@ -403,6 +510,34 @@ const Perf = struct {
         try pipe_pairs.closeTheirs();
 
         return .{ .child_proc = child, .ack_pipe = pipe_pairs.my_r, .ctl_pipe = pipe_pairs.my_w };
+    }
+
+    fn recordArgs(pid_str: []const u8, ctl_fd_str: []const u8) [9][]const u8 {
+        return [_][]const u8{
+            "perf",
+            "record",
+            "-g",
+            "-e",
+            "cycles",
+            "-p",
+            pid_str,
+            "--delay=-1",
+            ctl_fd_str,
+        };
+    }
+
+    fn traceArgs(pid_str: []const u8, ctl_fd_str: []const u8) [9][]const u8 {
+        return [_][]const u8{
+            "perf",
+            "stat",
+            "-x,",
+            "-e",
+            "syscalls:sys_enter_*",
+            "-p",
+            pid_str,
+            "--delay=-1",
+            ctl_fd_str,
+        };
     }
 
     fn wait(self: *Perf, io: Io) Err!void {
@@ -574,37 +709,38 @@ const RunOptions = struct {
     lgen_opts: InitOptions = .{},
 };
 
-/// Asserts cpu1 and cpu2 are different.
-pub fn run(io: Io, arena: *ArenaAllocator, cmd: anytype, opts: RunOptions) Err!void {
+/// Asserts cpu1 and cpu2 are different and gte 0.
+pub fn run(io: Io, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void {
     assert(cmd.cpu1 != cmd.cpu2);
+    assert(cmd.cpu1 >= 0);
+    assert(cmd.cpu2 >= 0);
 
-    var server_ctx: srv.Context = .{
-        .cpu = try cpuNSet(cmd.cpu1),
-        .sock = undefined,
-        .count_allocs = false,
-        .port = cmd.port,
-    };
+    const cpu1 = try cpuNSet(cmd.cpu1);
+    const cpu2 = try cpuNSet(cmd.cpu2);
 
-    var lg_ctx: load_gen.Context = .{
-        .cpu = try cpuNSet(cmd.cpu2),
-        .workload = .{
-            .key_count = cmd.@"key-count",
-            .operation = cmd.op,
-            .requests = cmd.requests,
-            .seed = cmd.seed,
-        },
-        .sock = undefined,
-    };
+    var op_iter = cmd.ops.iterator();
 
-    var runner: Runner = undefined;
-    try runner.init(&server_ctx, &lg_ctx, opts.lgen_opts, opts.serv_opts);
+    while (op_iter.next()) |op| {
+        for (std.enums.values(MeasurementType)) |measurement_type| {
+            errdefer logErr("{t} {t} measurement failed\n", .{ op, measurement_type }) catch {};
 
-    {
-        errdefer runner.kill();
-        try runner.profile(io, arena, opts.perf_opts);
+            try Measurement.measure(io, arena, .{
+                .cpu1 = cpu1,
+                .cpu2 = cpu2,
+                .port = cmd.port,
+                .measurement_type = measurement_type,
+                .workload = .{
+                    .key_count = cmd.key_count,
+                    .operation = op,
+                    .requests = cmd.requests,
+                    .seed = cmd.seed,
+                },
+                .lgen_init = opts.lgen_opts,
+                .serv_init = opts.serv_opts,
+                .perf_init = opts.perf_opts,
+            });
+        }
     }
-
-    try runner.wait();
 }
 
 fn waitHandle(pid: *i32, sock_fd: *i32) Err!u8 {
@@ -680,25 +816,15 @@ test "setCpuset" {
     try testing.expectError(Err.Err, setCpuset(&set, std.math.maxInt(i32)));
 }
 
-const RunCmd = struct {
-    port: u16,
-    cpu1: i32,
-    cpu2: i32,
-    requests: u64,
-    @"key-count": u64,
-    seed: u64,
-    op: load_gen.Op,
-};
-
 test "happy path" {
-    const run_cmd: RunCmd = .{
+    const run_cmd: Run = .{
         .port = 9999,
         .cpu1 = 1,
         .cpu2 = 2,
         .requests = 1000,
-        .@"key-count" = 500,
+        .key_count = 500,
         .seed = 2349834,
-        .op = .delete_hit,
+        .ops = .initOne(.delete_hit),
     };
     try testRun(run_cmd, &basicFakeServ, &basicFakeLgen, &basicFakePerf, false);
 }
@@ -890,7 +1016,7 @@ fn basicFakePerf(arg: usize) callconv(.c) u8 {
 }
 
 fn testRun(
-    cmd: anytype,
+    cmd: Run,
     fakeServFunc: CloneTarget,
     fakeLgenFunc: CloneTarget,
     fakePerfFunc: CloneTarget,

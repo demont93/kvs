@@ -197,6 +197,8 @@ pub fn build(b: *std.Build) void {
         .filters = test_filters,
     });
 
+    const install_profile_response_tests = b.addInstallArtifact(profile_response_tests, .{});
+
     const run_profile_response_tests = b.addRunArtifact(profile_response_tests);
 
     const profile_response_test_step = b.step(
@@ -204,4 +206,5 @@ pub fn build(b: *std.Build) void {
         "Test the profile reponse program",
     );
     profile_response_test_step.dependOn(&run_profile_response_tests.step);
+    profile_response_test_step.dependOn(&install_profile_response_tests.step);
 }

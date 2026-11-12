@@ -16,13 +16,13 @@ pub const Workload = struct {
     seed: u64,
 };
 
-pub const Op = enum {
-    get_hit,
-    get_miss,
-    set_insert,
-    set_replace,
-    delete_hit,
-    delete_miss,
+pub const Op = enum(u6) {
+    get_hit = 0b1,
+    get_miss = 0b10,
+    set_insert = 0b100,
+    set_replace = 0b1000,
+    delete_hit = 0b10000,
+    delete_miss = 0b100000,
 };
 
 pub const Message = enum(u8) {

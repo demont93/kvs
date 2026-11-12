@@ -13,7 +13,19 @@ pub fn main(init: std.process.Init) !void {
     const maybe_cmd = try cli.run(init.arena, &args);
 
     if (maybe_cmd) |cmd| switch (cmd) {
-        .run => |inner| try runner.run(init.io, init.arena, inner, .{}),
+        .run => |cli_args| {
+            const parsed = runner.Run{
+                .cpu1 = cli_args.cpu1,
+                .cpu2 = cli_args.cpu2,
+                .key_count = cli_args.@"key-count",
+                .ops = .initOne(cli_args.op),
+                .port = cli_args.port,
+                .requests = cli_args.requests,
+                .seed = cli_args.seed,
+            };
+
+            try runner.run(init.io, init.arena, parsed, .{});
+        },
     };
 }
 
