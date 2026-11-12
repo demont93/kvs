@@ -17,12 +17,23 @@ pub const Workload = struct {
 };
 
 pub const Op = enum(u6) {
-    get_hit = 0b1,
-    get_miss = 0b10,
-    set_insert = 0b100,
-    set_replace = 0b1000,
-    delete_hit = 0b10000,
-    delete_miss = 0b100000,
+    get_hit,
+    get_miss,
+    set_insert,
+    set_replace,
+    delete_hit,
+    delete_miss,
+
+    fn formatted(self: Op) []const u8 {
+        return switch (self) {
+            .get_hit => "get-hit",
+            .get_miss => "get-miss",
+            .set_insert => "set-insert",
+            .set_replace => "set-replace",
+            .delete_hit => "delete-hit",
+            .delete_miss => "delete-miss",
+        };
+    }
 };
 
 pub const Message = enum(u8) {

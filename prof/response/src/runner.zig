@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const build_info = @import("build_info");
 const linux = std.os.linux;
 const errno = linux.errno;
 const panic = std.debug.panic;
@@ -8,6 +10,7 @@ const Io = std.Io;
 const mem = std.mem;
 const assert = std.debug.assert;
 const testing = std.testing;
+const Allocator = std.mem.Allocator;
 
 const lib = @import("lib.zig");
 const errnoBug = lib.errnoBug;
@@ -150,11 +153,6 @@ const Measurement = struct {
             };
         }
     }
-
-    fn writeAllocationsReport(self: Measurement, report: srv.Report) Err!void {
-        
-    }
-
 
     fn measure(io: Io, arena: *ArenaAllocator, opts: Measurement.Options) Err!void {
         var measurement: Measurement = undefined;
@@ -700,6 +698,245 @@ const Perf = struct {
         };
 
         return fds;
+    }
+};
+
+const reporting = struct {
+    const reports_dirname = "reports";
+    const meta_filename = "meta.txt";
+
+    fn ensureReportsDir(io: Io) !void {
+        const cwd = Io.Dir.cwd();
+        try cwd.createDirPath(io, reports_dirname);
+    }
+
+    /// Returns the id_str.
+    fn createReportsDir(io: Io, arena: *ArenaAllocator) ![]u8 {
+        const reports_dir = try openReportsDir(io);
+        const now = Io.Timestamp.now(io, .real);
+        const dirname = try idStr(arena, now);
+
+        try reports_dir.createDir(io, dirname, .default_dir);
+
+        return dirname;
+    }
+
+    /// Returns the absolute path.
+    fn createMeasurementDir(io: Io, reports_dir: Io.Dir, op: load_gen.Op) !Io.Dir {
+        const head = op.formatted();
+        try reports_dir.createDir(io, head, .default_dir);
+        errdefer reports_dir.deleteDir(io, head) catch {
+            std.debug.print("error deleting measurement dir\n", .{});
+        };
+        return reports_dir.openDir(io, head, .{});
+    }
+
+    fn perfFilename(io: Io, arena: *ArenaAllocator, measurement_dir: Io.Dir) ![]u8 {
+        var buf: [std.fs.max_path_bytes]u8 = undefined;
+        const size = measurement_dir.realPath(io, &buf);
+        return std.fs.path.join(arena.allocator(), .{ buf[0..size], "perf.data" });
+    }
+
+    fn allocsFile(io: Io, measurement_dir: Io.Dir) !Io.File {
+        errdefer std.debug.print("creating allocs file\n", .{});
+
+        const allocs_head = "allocs.txt";
+        return openCreateFileWrite(io, measurement_dir, allocs_head);
+    }
+
+    fn traceFile(io: Io, measurement_dir: Io.Dir) !Io.File {
+        errdefer std.debug.print("creating trace file\n", .{});
+
+        const trace_head = "trace.csv";
+        return openCreateFileWrite(io, measurement_dir, trace_head);
+    }
+
+    fn openCreateFileWrite(io: Io, dir: Io.Dir, head: []const u8) !Io.File {
+        try dir.createFile(io, head, .{});
+        errdefer dir.deleteFile(io, head) catch {
+            std.debug.print("error cleaning up new file after error\n", .{});
+        };
+        return dir.openFile(io, head, .{ .mode = .write_only });
+    }
+
+    fn utcTimeStr(timestamp: Io.Clock.Timestamp) ![20]u8 {
+        assert(timestamp.clock == .real);
+
+        const es: std.time.epoch.EpochSeconds = .{ .secs = timestamp.toSeconds() };
+        const ds = es.getDaySeconds();
+        const ed = es.getEpochDay();
+        const yd = ed.calculateYearDay();
+        const md = yd.calculateMonthDay();
+
+        var buf: [20]u8 = undefined;
+        var w = Io.Writer.fixed(&buf);
+
+        try w.print(
+            "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
+            .{ yd.year, md.month.numeric(), md.day_index, ds.getHoursIntoDay() },
+            ds.getMinutesIntoHour(),
+            ds.getSecondsIntoMinute(),
+            build_info.git_hash,
+        );
+        return buf;
+    }
+
+    fn idStr(arena: *ArenaAllocator, timestamp: Io.Clock.Timestamp) ![]u8 {
+        const time_str = try utcTimeStr(timestamp);
+        return std.fmt.allocPrint(arena.allocator(), "{s}-{s}", .{ time_str, build_info.git_hash });
+    }
+
+    const Meta = struct {
+        run_start: Io.Clock.Timestamp,
+        run_success: bool,
+        run_args: Run,
+    };
+
+    fn writeMeta(
+        io: Io,
+        arena: *ArenaAllocator,
+        reports_dir: Io.Dir,
+        meta: Meta,
+    ) !void {
+        try reports_dir.createFile(io, meta_filename, .{});
+        errdefer reports_dir.deleteFile(io, meta_filename);
+
+        const f = try reports_dir.openFile(io, meta_filename, .{ .mode = .write_only });
+        defer f.close(io);
+
+        var r_buf: [256]u8 = undefined;
+
+        var file_writer_buf: [256]u8 = undefined;
+        var w = f.writer(io, &file_writer_buf);
+
+        var uname: linux.utsname = undefined;
+        switch (errno(linux.uname(&uname))) {
+            .SUCCESS => {},
+            else => |e| errnoBug("uname", e),
+        }
+
+        const id_str = try idStr(arena, meta.run_start);
+        const run_start_str = try utcTimeStr(meta.run_start);
+
+        const cpu_info = try readFile(io, arena, "/proc/cpuinfo", &r_buf);
+
+        const cpu_model_name = blk: {
+            const start = std.mem.find(u8, cpu_info, "model name") orelse
+                return logErr("couldn't find model name on cpuinfo\n", .{});
+            const sep = start + std.mem.find(u8, cpu_info[start..], ":").?;
+            const end = std.mem.find(u8, cpu_info[sep + 2 ..], "\n").?;
+            break :blk cpu_info[sep + 2 .. end];
+        };
+
+        const isolated = try readFile(io, arena, "/sys/devices/system/cpu/isolated", &r_buf);
+
+        const no_turbo = try readFile(
+            io,
+            arena,
+            "/sys/devices/system/cpu/intel_pstate/no_turbo",
+            &r_buf,
+        );
+
+        const epp1 = try readFile(
+            io,
+            arena,
+            try std.fmt.allocPrint(
+                arena.allocator(),
+                "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference ",
+                .{meta.run_args.cpu1},
+            ),
+        );
+
+        const epp2 = try readFile(
+            io,
+            arena,
+            try std.fmt.allocPrint(
+                arena.allocator(),
+                "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference ",
+                .{meta.run_args.cpu2},
+            ),
+        );
+
+        const perf_version = blk: {
+            const cmd = try std.process.spawn(io, .{ .argv = .{ "perf", "-v" }, .stdout = .pipe });
+            break :blk try cmd.stdout.?
+                .reader(io, &r_buf)
+                .interface.allocRemaining(arena.allocator(), 1 << 10);
+        };
+
+        const ops = blk: {
+            var it = meta.run_args.ops.iterator();
+            var final = std.ArrayList(u8).empty;
+            var sep = false;
+            while (it.next()) |op| {
+                if (sep) {
+                    try final.append(arena.allocator(), ',');
+                }
+                try final.appendSlice(arena.allocator(), op.formatted());
+                sep = true;
+            }
+            break :blk final.items;
+        };
+
+        try w.interface.writeAll(
+            \\run.id={s}
+            \\run.started_utc={s}
+            \\run.status={s}
+            \\
+            \\build.git_hash={s}
+            \\build.git_dirty={}
+            \\build.mode={s}
+            \\build.zig={s}
+            \\
+            \\host.kernel={s}
+            \\host.cpu={s}
+            \\host.isolated={s}
+            \\host.no_turbo={s}
+            \\host.load_gen.affinity={}
+            \\host.load_gen.epp={s}
+            \\host.server.affinity={}
+            \\host.server.epp={s}
+            \\host.perf_version={s}
+            \\
+            \\workload.ops={s}
+            \\workload.requests={}
+            \\workload.key_count={}
+            \\workload.seed={}
+            \\
+        ,
+            .{
+                id_str,
+                run_start_str,
+                if (meta.run_success) "success" else "error",
+                build_info.git_hash_full,
+                build_info.git_dirty,
+                @tagName(builtin.mode),
+                builtin.zig_version_string,
+                uname.release,
+                cpu_model_name,
+                isolated,
+                no_turbo,
+                meta.run_args.cpu1,
+                epp1,
+                meta.run_args.cpu2,
+                epp2,
+                perf_version,
+                ops,
+                meta.run_args.requests,
+                meta.run_args.key_count,
+                meta.run_args.seed,
+            },
+        );
+    }
+
+    fn readFile(io: Io, arena: *ArenaAllocator, path: []const u8, buf: []u8) ![]u8 {
+        const cpuinfo_file = try Io.Dir.openFileAbsolute(io, path, .{});
+        var r = cpuinfo_file.reader(io, buf);
+        return r.interface.allocRemaining(arena.allocator(), 1 << 20);
+    }
+
+    fn openReportsDir(io: Io) !Io.Dir {
+        return std.Io.Dir.cwd().openDir(io, reports_dirname, .{});
     }
 };
 
