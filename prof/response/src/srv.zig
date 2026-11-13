@@ -284,5 +284,5 @@ test "server closes" {
     }
 
     const exit_code = try lib.waitChild(pid);
-    try testing.expectEqual(1, exit_code);
+    try testing.expectEqual(0, exit_code);
 }

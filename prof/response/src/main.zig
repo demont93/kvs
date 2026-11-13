@@ -24,11 +24,14 @@ pub fn main(init: std.process.Init) !void {
                 .seed = cli_args.seed,
             };
 
-            try runner.run(init.io, init.arena, parsed, .{});
+            try runner.run(init.io, init.gpa, init.arena, parsed, .{});
         },
     };
 }
 
 test {
     _ = @import("runner.zig");
+    _ = @import("Cli.zig");
+    _ = @import("srv.zig");
+    _ = @import("load_gen.zig");
 }

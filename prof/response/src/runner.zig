@@ -45,12 +45,14 @@ const Measurement = struct {
     server_handle: ServerHandle,
     lg_handle: LoadGenHandle,
     measurement_type: MeasurementType,
+    measurement_dir: *Report.MeasurementDir,
 
     const Options = struct {
         port: u16,
         cpu1: linux.cpu_set_t,
         cpu2: linux.cpu_set_t,
         measurement_type: MeasurementType,
+        measurement_dir: *Report.MeasurementDir,
         workload: load_gen.Workload,
         lgen_init: InitOptions,
         serv_init: InitOptions,
@@ -64,6 +66,8 @@ const Measurement = struct {
         errdefer logErr("initializing measurement execution\n", .{}) catch {};
 
         self.measurement_type = opts.measurement_type;
+        self.measurement_dir = opts.measurement_dir;
+
         self.lg_handle = try LoadGenHandle.init(opts.cpu1, opts.workload, opts.lgen_init);
 
         self.server_handle = ServerHandle.init(
@@ -96,11 +100,9 @@ const Measurement = struct {
     fn run(self: *Measurement, io: Io, arena: *ArenaAllocator, perf_opts: InitOptions) !void {
         errdefer logErr("{t} measurement failed\n", .{self.measurement_type}) catch {};
 
-        var report: srv.Report = undefined;
-
-        const perf_op: Perf.Op = switch (self.measurement_type) {
-            .count => .trace,
-            .profile => .record,
+        const perf_op: Perf.OpArgs = switch (self.measurement_type) {
+            .count => .{ .trace = try self.measurement_dir.traceFilename() },
+            .profile => .{ .record = try self.measurement_dir.recordFilename() },
         };
 
         var perf = try Perf.init(io, arena, self.server_handle.pid, perf_op, perf_opts);
@@ -125,11 +127,21 @@ const Measurement = struct {
 
             switch (self.measurement_type) {
                 .profile => {},
-                .count => try self.server_handle.awaitResult(&report),
+                .count => try self.handleAllocsReport(io),
             }
         }
 
         try perf.wait(io);
+    }
+
+    fn handleAllocsReport(self: *Measurement, io: Io) !void {
+        var report: srv.Report = undefined;
+        try self.server_handle.awaitResult(&report);
+        const f = try self.measurement_dir.allocsFile();
+        errdefer self.measurement_dir.deleteAllocsFile() catch {
+            std.debug.print("cleaning up allocs file\n", .{});
+        };
+        try Report.writeAllocReport(io, f, report);
     }
 
     fn initPollFds(self: Measurement, perf: Perf, poll_fds: *[3]linux.pollfd) void {
@@ -161,7 +173,7 @@ const Measurement = struct {
 
         {
             errdefer measurement.kill();
-            try measurement.run(io, arena, opts.perf_init);
+            measurement.run(io, arena, opts.perf_init) catch return Err.Err;
         }
 
         try measurement.wait();
@@ -449,11 +461,16 @@ const Perf = struct {
 
     const Op = enum { record, trace };
 
+    const OpArgs = union(Op) {
+        record: []const u8,
+        trace: []const u8,
+    };
+
     fn init(
         io: Io,
         arena: *ArenaAllocator,
         pid: i32,
-        op: Op,
+        op: OpArgs,
         opts: InitOptions,
     ) Err!Perf {
         errdefer {
@@ -474,16 +491,18 @@ const Perf = struct {
             switch (opts.init) {
                 .default => {
                     const args = switch (op) {
-                        .record => recordArgs(
+                        .record => |v| recordArgs(
                             try pidStr(arena, pid),
                             try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
+                            v,
                         ),
-                        .trace => traceArgs(
+                        .trace => |v| traceArgs(
                             try pidStr(arena, pid),
                             try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
+                            v,
                         ),
                     };
-                    break :blk process.spawn(io, .{ .argv = args }) catch |err| switch (err) {
+                    break :blk process.spawn(io, .{ .argv = &args }) catch |err| switch (err) {
                         else => |e| return logErr("failed to spawn perf: {t}\n", .{e}),
                     };
                 },
@@ -510,7 +529,11 @@ const Perf = struct {
         return .{ .child_proc = child, .ack_pipe = pipe_pairs.my_r, .ctl_pipe = pipe_pairs.my_w };
     }
 
-    fn recordArgs(pid_str: []const u8, ctl_fd_str: []const u8) [9][]const u8 {
+    fn recordArgs(
+        pid_str: []const u8,
+        ctl_fd_str: []const u8,
+        filename: []const u8,
+    ) [11][]const u8 {
         return [_][]const u8{
             "perf",
             "record",
@@ -521,10 +544,12 @@ const Perf = struct {
             pid_str,
             "--delay=-1",
             ctl_fd_str,
+            "-o",
+            filename,
         };
     }
 
-    fn traceArgs(pid_str: []const u8, ctl_fd_str: []const u8) [9][]const u8 {
+    fn traceArgs(pid_str: []const u8, ctl_fd_str: []const u8, filename: []const u8) [11][]const u8 {
         return [_][]const u8{
             "perf",
             "stat",
@@ -535,6 +560,8 @@ const Perf = struct {
             pid_str,
             "--delay=-1",
             ctl_fd_str,
+            "-o",
+            filename,
         };
     }
 
@@ -701,68 +728,106 @@ const Perf = struct {
     }
 };
 
-const reporting = struct {
-    const reports_dirname = "reports";
+const Report = struct {
+    const root_dirname = "reports";
     const meta_filename = "meta.txt";
 
-    fn ensureReportsDir(io: Io) !void {
-        const cwd = Io.Dir.cwd();
-        try cwd.createDirPath(io, reports_dirname);
-    }
+    io: Io,
+    id_str: []const u8,
+    dir: Io.Dir,
+    run_start: Io.Clock.Timestamp,
 
-    /// Returns the id_str.
-    fn createReportsDir(io: Io, arena: *ArenaAllocator) ![]u8 {
-        const reports_dir = try openReportsDir(io);
-        const now = Io.Timestamp.now(io, .real);
-        const dirname = try idStr(arena, now);
-
-        try reports_dir.createDir(io, dirname, .default_dir);
-
-        return dirname;
-    }
-
-    /// Returns the absolute path.
-    fn createMeasurementDir(io: Io, reports_dir: Io.Dir, op: load_gen.Op) !Io.Dir {
-        const head = op.formatted();
-        try reports_dir.createDir(io, head, .default_dir);
-        errdefer reports_dir.deleteDir(io, head) catch {
-            std.debug.print("error deleting measurement dir\n", .{});
-        };
-        return reports_dir.openDir(io, head, .{});
-    }
-
-    fn perfFilename(io: Io, arena: *ArenaAllocator, measurement_dir: Io.Dir) ![]u8 {
-        var buf: [std.fs.max_path_bytes]u8 = undefined;
-        const size = measurement_dir.realPath(io, &buf);
-        return std.fs.path.join(arena.allocator(), .{ buf[0..size], "perf.data" });
-    }
-
-    fn allocsFile(io: Io, measurement_dir: Io.Dir) !Io.File {
-        errdefer std.debug.print("creating allocs file\n", .{});
-
+    const MeasurementDir = struct {
         const allocs_head = "allocs.txt";
-        return openCreateFileWrite(io, measurement_dir, allocs_head);
+
+        io: Io,
+        arena: ArenaAllocator,
+        dir: Io.Dir,
+
+        fn init(
+            io: Io,
+            allocator: Allocator,
+            reports_dir: Io.Dir,
+            op: load_gen.Op,
+        ) !MeasurementDir {
+            const head = op.formatted();
+            try reports_dir.createDir(io, head, .default_dir);
+            errdefer reports_dir.deleteDir(io, head) catch {
+                std.debug.print("error deleting measurement dir\n", .{});
+            };
+
+            return .{
+                .dir = try reports_dir.openDir(io, head, .{}),
+                .arena = ArenaAllocator.init(allocator),
+                .io = io,
+            };
+        }
+
+        fn recordFilename(self: *MeasurementDir) ![]u8 {
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const size = try self.dir.realPath(self.io, &buf);
+            return std.fs.path.join(self.arena.allocator(), &.{ buf[0..size], "perf.data" });
+        }
+
+        fn allocsFile(self: MeasurementDir) !Io.File {
+            errdefer std.debug.print("creating allocs file\n", .{});
+            return openCreateFileWrite(self.io, self.dir, allocs_head);
+        }
+
+        fn deleteAllocsFile(self: MeasurementDir) !void {
+            return self.dir.deleteFile(self.io, allocs_head);
+        }
+
+        fn traceFilename(self: *MeasurementDir) ![]u8 {
+            const trace_head = "trace.csv";
+            var buf: [std.fs.max_path_bytes]u8 = undefined;
+            const size = try self.dir.realPath(self.io, &buf);
+            return std.fs.path.join(self.arena.allocator(), &.{ buf[0..size], trace_head });
+        }
+
+        fn deinit(self: MeasurementDir) void {
+            self.arena.deinit();
+        }
+    };
+
+    fn init(io: Io, arena: *ArenaAllocator) !Report {
+        const root_dir = try ensureRootDir(io);
+        defer root_dir.close(io);
+
+        const now = Io.Clock.Timestamp.now(io, .real);
+        const id_str = try idStr(arena, now);
+
+        try root_dir.createDir(io, id_str, .default_dir);
+        errdefer root_dir.deleteFile(io, id_str) catch {
+            std.debug.print("cleaning up report dir\n", .{});
+        };
+
+        return .{
+            .run_start = now,
+            .io = io,
+            .id_str = id_str,
+            .dir = try root_dir.openDir(io, id_str, .{}),
+        };
     }
 
-    fn traceFile(io: Io, measurement_dir: Io.Dir) !Io.File {
-        errdefer std.debug.print("creating trace file\n", .{});
+    fn measurementDir(self: Report, allocator: Allocator, op: load_gen.Op) !MeasurementDir {
+        return .init(self.io, allocator, self.dir, op);
+    }
 
-        const trace_head = "trace.csv";
-        return openCreateFileWrite(io, measurement_dir, trace_head);
+    fn ensureRootDir(io: Io) !Io.Dir {
+        const cwd = Io.Dir.cwd();
+        try cwd.createDirPath(io, root_dirname);
+        return cwd.openDir(io, root_dirname, .{});
     }
 
     fn openCreateFileWrite(io: Io, dir: Io.Dir, head: []const u8) !Io.File {
-        try dir.createFile(io, head, .{});
-        errdefer dir.deleteFile(io, head) catch {
-            std.debug.print("error cleaning up new file after error\n", .{});
-        };
-        return dir.openFile(io, head, .{ .mode = .write_only });
+        return dir.createFile(io, head, .{});
     }
 
     fn utcTimeStr(timestamp: Io.Clock.Timestamp) ![20]u8 {
         assert(timestamp.clock == .real);
 
-        const es: std.time.epoch.EpochSeconds = .{ .secs = timestamp.toSeconds() };
+        const es: std.time.epoch.EpochSeconds = .{ .secs = @intCast(timestamp.raw.toSeconds()) };
         const ds = es.getDaySeconds();
         const ed = es.getEpochDay();
         const yd = ed.calculateYearDay();
@@ -773,10 +838,10 @@ const reporting = struct {
 
         try w.print(
             "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
-            .{ yd.year, md.month.numeric(), md.day_index, ds.getHoursIntoDay() },
-            ds.getMinutesIntoHour(),
-            ds.getSecondsIntoMinute(),
-            build_info.git_hash,
+            .{
+                yd.year,              md.month.numeric(),      md.day_index,
+                ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
+            },
         );
         return buf;
     }
@@ -787,27 +852,21 @@ const reporting = struct {
     }
 
     const Meta = struct {
-        run_start: Io.Clock.Timestamp,
         run_success: bool,
         run_args: Run,
     };
 
-    fn writeMeta(
-        io: Io,
-        arena: *ArenaAllocator,
-        reports_dir: Io.Dir,
-        meta: Meta,
-    ) !void {
-        try reports_dir.createFile(io, meta_filename, .{});
-        errdefer reports_dir.deleteFile(io, meta_filename);
-
-        const f = try reports_dir.openFile(io, meta_filename, .{ .mode = .write_only });
-        defer f.close(io);
+    fn writeMeta(self: Report, arena: *ArenaAllocator, meta: Meta) !void {
+        const f = try self.dir.createFile(self.io, meta_filename, .{});
+        errdefer self.dir.deleteFile(self.io, meta_filename) catch {
+            std.debug.print("cleaning up meta file\n", .{});
+        };
+        defer f.close(self.io);
 
         var r_buf: [256]u8 = undefined;
 
         var file_writer_buf: [256]u8 = undefined;
-        var w = f.writer(io, &file_writer_buf);
+        var w = f.writer(self.io, &file_writer_buf);
 
         var uname: linux.utsname = undefined;
         switch (errno(linux.uname(&uname))) {
@@ -815,10 +874,9 @@ const reporting = struct {
             else => |e| errnoBug("uname", e),
         }
 
-        const id_str = try idStr(arena, meta.run_start);
-        const run_start_str = try utcTimeStr(meta.run_start);
+        const run_start_str = try utcTimeStr(self.run_start);
 
-        const cpu_info = try readFile(io, arena, "/proc/cpuinfo", &r_buf);
+        const cpu_info = try readFile(self.io, arena, "/proc/cpuinfo", &r_buf);
 
         const cpu_model_name = blk: {
             const start = std.mem.find(u8, cpu_info, "model name") orelse
@@ -828,40 +886,41 @@ const reporting = struct {
             break :blk cpu_info[sep + 2 .. end];
         };
 
-        const isolated = try readFile(io, arena, "/sys/devices/system/cpu/isolated", &r_buf);
+        const isolated = try readFile(self.io, arena, "/sys/devices/system/cpu/isolated", &r_buf);
 
         const no_turbo = try readFile(
-            io,
+            self.io,
             arena,
             "/sys/devices/system/cpu/intel_pstate/no_turbo",
             &r_buf,
         );
 
         const epp1 = try readFile(
-            io,
+            self.io,
             arena,
             try std.fmt.allocPrint(
                 arena.allocator(),
                 "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference ",
                 .{meta.run_args.cpu1},
             ),
+            &r_buf,
         );
 
         const epp2 = try readFile(
-            io,
+            self.io,
             arena,
             try std.fmt.allocPrint(
                 arena.allocator(),
                 "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference ",
                 .{meta.run_args.cpu2},
             ),
+            &r_buf,
         );
 
         const perf_version = blk: {
-            const cmd = try std.process.spawn(io, .{ .argv = .{ "perf", "-v" }, .stdout = .pipe });
-            break :blk try cmd.stdout.?
-                .reader(io, &r_buf)
-                .interface.allocRemaining(arena.allocator(), 1 << 10);
+            const cmd = try std.process.spawn(self.io, .{ .argv = &.{ "perf", "-v" }, .stdout = .pipe });
+            var r = cmd.stdout.?.reader(self.io, &r_buf);
+            break :blk try r.interface.allocRemaining(arena.allocator(), .limited(1 << 10));
         };
 
         const ops = blk: {
@@ -878,7 +937,7 @@ const reporting = struct {
             break :blk final.items;
         };
 
-        try w.interface.writeAll(
+        try w.interface.print(
             \\run.id={s}
             \\run.started_utc={s}
             \\run.status={s}
@@ -905,7 +964,7 @@ const reporting = struct {
             \\
         ,
             .{
-                id_str,
+                self.id_str,
                 run_start_str,
                 if (meta.run_success) "success" else "error",
                 build_info.git_hash_full,
@@ -927,16 +986,27 @@ const reporting = struct {
                 meta.run_args.seed,
             },
         );
+        try w.flush();
+    }
+
+    fn writeAllocReport(io: Io, f: Io.File, report: srv.Report) !void {
+        var w_buf: [256]u8 = undefined;
+        var w = f.writer(io, &w_buf);
+        try w.interface.print(
+            \\allocation_count={}
+            \\remap_count={}
+            \\resize_count={}
+            \\
+        ,
+            .{ report.alloc_count, report.remap_count, report.resize_count },
+        );
+        try w.flush();
     }
 
     fn readFile(io: Io, arena: *ArenaAllocator, path: []const u8, buf: []u8) ![]u8 {
         const cpuinfo_file = try Io.Dir.openFileAbsolute(io, path, .{});
         var r = cpuinfo_file.reader(io, buf);
-        return r.interface.allocRemaining(arena.allocator(), 1 << 20);
-    }
-
-    fn openReportsDir(io: Io) !Io.Dir {
-        return std.Io.Dir.cwd().openDir(io, reports_dirname, .{});
+        return r.interface.allocRemaining(arena.allocator(), .limited(1 << 20));
     }
 };
 
@@ -946,8 +1016,12 @@ const RunOptions = struct {
     lgen_opts: InitOptions = .{},
 };
 
+pub fn run2(io: Io, gpa: Allocator, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void {
+
+}
+
 /// Asserts cpu1 and cpu2 are different and gte 0.
-pub fn run(io: Io, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void {
+pub fn run(io: Io, gpa: Allocator, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void {
     assert(cmd.cpu1 != cmd.cpu2);
     assert(cmd.cpu1 >= 0);
     assert(cmd.cpu2 >= 0);
@@ -955,17 +1029,24 @@ pub fn run(io: Io, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void 
     const cpu1 = try cpuNSet(cmd.cpu1);
     const cpu2 = try cpuNSet(cmd.cpu2);
 
+    const report_dir = Report.init(io, arena) catch |e| {
+        std.debug.print("error initializing reports: {t}\n", .{e});
+        return Err.Err;
+    };
+
     var op_iter = cmd.ops.iterator();
 
-    while (op_iter.next()) |op| {
-        for (std.enums.values(MeasurementType)) |measurement_type| {
-            errdefer logErr("{t} {t} measurement failed\n", .{ op, measurement_type }) catch {};
+    const result = rslt: while (op_iter.next()) |op| {
+        var measurement_dir = report_dir.measurementDir(gpa, op) catch |e| break e;
+        defer measurement_dir.deinit();
 
-            try Measurement.measure(io, arena, .{
+        for (std.enums.values(MeasurementType)) |measurement_type| {
+            Measurement.measure(io, arena, .{
                 .cpu1 = cpu1,
                 .cpu2 = cpu2,
                 .port = cmd.port,
                 .measurement_type = measurement_type,
+                .measurement_dir = &measurement_dir,
                 .workload = .{
                     .key_count = cmd.key_count,
                     .operation = op,
@@ -975,9 +1056,23 @@ pub fn run(io: Io, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void 
                 .lgen_init = opts.lgen_opts,
                 .serv_init = opts.serv_opts,
                 .perf_init = opts.perf_opts,
-            });
+            }) catch |e| {
+                logErr("{t} {t} measurement failed\n", .{ op, measurement_type }) catch {};
+                break :rslt e;
+            };
         }
-    }
+    };
+
+    const write_meta_result = report_dir.writeMeta(arena, .{
+        .run_args = cmd,
+        .run_success = if (result) |_| true else |_| false,
+    }) catch |e| blk: {
+        std.debug.print("error writing meta: {t}\n", .{e});
+        break :blk Err.Err;
+    };
+
+    try result;
+    try write_meta_result;
 }
 
 fn waitHandle(pid: *i32, sock_fd: *i32) Err!u8 {
@@ -1070,10 +1165,11 @@ test "perf is killed if it hangs after stop ack" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    var perf = try Perf.record(
+    var perf = try Perf.init(
         testing.io,
         &arena,
         34,
+        .{ .record = "file.txt" },
         .{ .init = .{ .test_spawn = perfTestFunc(hangingFakePerf) } },
     );
 
@@ -1086,10 +1182,11 @@ test "perf handle returns error if unexpected close" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
-    var perf = try Perf.record(
+    var perf = try Perf.init(
         testing.io,
         &arena,
         342,
+        .{ .record = "file.txt" },
         .{ .init = .{ .test_spawn = perfTestFunc(unexpectedCloseFakePerf) } },
     );
     try perf.enable();
@@ -1265,6 +1362,7 @@ fn testRun(
     if (err) {
         try testing.expectError(Err.Err, run(
             testing.io,
+            testing.allocator,
             &arena,
             cmd,
             .{
@@ -1276,6 +1374,7 @@ fn testRun(
     } else {
         try run(
             testing.io,
+            testing.allocator,
             &arena,
             cmd,
             .{

@@ -24,7 +24,7 @@ pub const Op = enum(u6) {
     delete_hit,
     delete_miss,
 
-    fn formatted(self: Op) []const u8 {
+    pub fn formatted(self: Op) []const u8 {
         return switch (self) {
             .get_hit => "get-hit",
             .get_miss => "get-miss",

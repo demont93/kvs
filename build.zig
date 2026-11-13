@@ -170,6 +170,16 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&mod_tests.step);
     check_step.dependOn(&exe_tests.step);
 
+    const build_info = b.addOptions();
+
+    const git_hash = std.mem.trim(u8, b.run(&.{ "git", "rev-parse", "--short", "HEAD" }), "\n");
+    const git_hash_full = std.mem.trim(u8, b.run(&.{ "git", "rev-parse", "HEAD" }), "\n");
+    const git_dirty = b.run(&.{ "git", "status", "--porcelain" }).len != 0;
+
+    build_info.addOption([]const u8, "git_hash", git_hash);
+    build_info.addOption([]const u8, "git_hash_full", git_hash_full);
+    build_info.addOption(bool, "git_dirty", git_dirty);
+
     // Profile server responses
     const profile_response = b.addExecutable(.{
         .name = "profile-response",
@@ -178,9 +188,7 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast }),
             .omit_frame_pointer = false,
-            .imports = &.{
-                .{ .name = "kvs", .module = mod },
-            },
+            .imports = &.{ .{ .name = "kvs", .module = mod }, .{ .name = "build_info", .module = build_info.createModule() } },
         }),
     });
 
