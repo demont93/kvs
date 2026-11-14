@@ -129,12 +129,14 @@ pub fn processMain(arg: usize) callconv(.c) u8 {
     if (server(ctx.*)) |_| {
         return ExitCode.success.value();
     } else |_| {
-        return ExitCode.success.value();
+        return ExitCode.err.value();
     }
 }
 
 fn server(ctx: Context) !void {
     defer lib.closeFdLog(ctx.sock);
+
+    try lib.closeRangeExcluding(ctx.sock);
 
     if (ctx.cpu) |*cpu| {
         try linux.sched_setaffinity(0, cpu);
@@ -165,11 +167,13 @@ fn server(ctx: Context) !void {
     };
     defer serv.close();
 
-    try sendReady(ctx.sock);
-
     var addr_buf: [15]u8 = undefined;
     const addr = try std.fmt.bufPrint(&addr_buf, "127.0.0.1:{}", .{ctx.port});
-    serv.listen_and_serve(addr);
+    try serv.bind(addr);
+
+    try sendReady(ctx.sock);
+
+    serv.serve();
 
     if (ctx.count_allocs) {
         try sendReport(ctx.sock, &report);

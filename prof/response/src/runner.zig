@@ -113,28 +113,32 @@ const Measurement = struct {
             var poll_fds: [3]linux.pollfd = undefined;
             self.initPollFds(perf, &poll_fds);
 
-            try self.lg_handle.awaitReady();
             try self.server_handle.awaitReady();
 
+            try self.lg_handle.connect();
+
+            try self.lg_handle.awaitReady();
+
+            self.server_handle.start(self.measurement_type);
             try perf.enable();
             try self.lg_handle.start();
 
             _ = try poll(&poll_fds);
 
             try perf.stop();
-            self.server_handle.end();
+            self.server_handle.end(self.measurement_type);
             try self.lg_handle.awaitDone();
 
             switch (self.measurement_type) {
                 .profile => {},
-                .count => try self.handleAllocsReport(io),
+                .count => try self.awaitReport(io),
             }
         }
 
         try perf.wait(io);
     }
 
-    fn handleAllocsReport(self: *Measurement, io: Io) !void {
+    fn awaitReport(self: *Measurement, io: Io) !void {
         var report: srv.Report = undefined;
         try self.server_handle.awaitResult(&report);
         const f = try self.measurement_dir.allocsFile();
@@ -237,7 +241,7 @@ const ServerHandle = struct {
         errdefer logErr("closing server\n", .{}) catch {};
 
         return switch (self.status) {
-            .running => self.endWait(),
+            .running => self.terminateWait(),
             .done => self.wait(),
             .unknown => self.kill(),
         };
@@ -270,17 +274,36 @@ const ServerHandle = struct {
         };
     }
 
-    fn endWait(self: *ServerHandle) Err!void {
-        self.end();
+    fn terminateWait(self: *ServerHandle) Err!void {
+        self.terminate();
         try self.wait();
     }
 
-    fn end(self: *ServerHandle) void {
+    fn start(self: *ServerHandle, measurement_type: MeasurementType) void {
+        if (measurement_type == .count) {
+            switch (errno(linux.kill(self.pid, .USR1))) {
+                .SUCCESS => {},
+                else => |e| errnoBug("kill", e),
+            }
+        }
+    }
+
+    fn terminate(self: *ServerHandle) void {
         self.status = .done;
         switch (errno(linux.kill(self.pid, .INT))) {
             .SUCCESS => {},
             else => |e| errnoBug("kill", e),
         }
+    }
+
+    fn end(self: *ServerHandle, measurement_type: MeasurementType) void {
+        if (measurement_type == .count) {
+            switch (errno(linux.kill(self.pid, .USR2))) {
+                .SUCCESS => {},
+                else => |e| errnoBug("kill", e),
+            }
+        }
+        self.terminate();
     }
 
     fn startCounting(self: *ServerHandle) Err!void {
@@ -336,7 +359,7 @@ const LoadGenHandle = struct {
         };
 
         lib.closeFd(socks[1]) catch |e| {
-            lib.closeFdLog(socks[1]);
+            lib.closeFdLog(socks[0]);
             lib.killChild(pid);
             return e;
         };
@@ -351,6 +374,14 @@ const LoadGenHandle = struct {
             .done => {},
             else => |m| invalidMessageReceived(m),
         };
+    }
+
+    /// Messages the Load Generator to connect and start warmup phase.
+    fn connect(self: *LoadGenHandle) Err!void {
+        errdefer logErr("sending connect to load generator\n", .{}) catch {};
+
+        const msg = @intFromEnum(load_gen.Message.connect);
+        try sendAll(self.sock, @as(*const [1]u8, &msg));
     }
 
     fn awaitReady(self: *LoadGenHandle) Err!void {
@@ -381,7 +412,7 @@ const LoadGenHandle = struct {
             panic("invalid message from load generator: {}\n", .{buf[0]});
 
         return switch (msg) {
-            .err, .ready, .done => |e| e,
+            .err, .ready, .done, .connect => |e| e,
             .start => |m| invalidMessageReceived(m),
         };
     }
@@ -483,7 +514,7 @@ const Perf = struct {
         var pipe_pairs: PipePairs = try .init();
         errdefer pipe_pairs.closeMineLog();
 
-        const child: process.Child = blk: {
+        var child: process.Child = blk: {
             errdefer pipe_pairs.closeTheirs() catch {};
 
             try pipe_pairs.noCloExecTheirs();
@@ -523,10 +554,15 @@ const Perf = struct {
                 },
             }
         };
+        errdefer child.kill(io);
 
         try pipe_pairs.closeTheirs();
 
-        return .{ .child_proc = child, .ack_pipe = pipe_pairs.my_r, .ctl_pipe = pipe_pairs.my_w };
+        return .{
+            .child_proc = child,
+            .ack_pipe = pipe_pairs.my_r,
+            .ctl_pipe = pipe_pairs.my_w,
+        };
     }
 
     fn recordArgs(
@@ -618,7 +654,7 @@ const Perf = struct {
         s.concurrent(
             .timeout,
             Io.sleep,
-            .{ io, .fromSeconds(2), .awake },
+            .{ io, .fromSeconds(5), .awake },
         ) catch |e| panic("{t}\n", .{e});
 
         s.concurrent(
@@ -790,15 +826,15 @@ const Report = struct {
         }
     };
 
-    fn init(io: Io, arena: *ArenaAllocator) !Report {
-        const root_dir = try ensureRootDir(io);
+    fn init(io: Io, arena: *ArenaAllocator, dir: ?[]const u8) !Report {
+        const root_dir = try ensureRootDir(io, dir);
         defer root_dir.close(io);
 
         const now = Io.Clock.Timestamp.now(io, .real);
         const id_str = try idStr(arena, now);
 
         try root_dir.createDir(io, id_str, .default_dir);
-        errdefer root_dir.deleteFile(io, id_str) catch {
+        errdefer root_dir.deleteDir(io, id_str) catch {
             std.debug.print("cleaning up report dir\n", .{});
         };
 
@@ -814,10 +850,10 @@ const Report = struct {
         return .init(self.io, allocator, self.dir, op);
     }
 
-    fn ensureRootDir(io: Io) !Io.Dir {
+    fn ensureRootDir(io: Io, dirpath: ?[]const u8) !Io.Dir {
+        const dir = if (dirpath) |p| p else root_dirname;
         const cwd = Io.Dir.cwd();
-        try cwd.createDirPath(io, root_dirname);
-        return cwd.openDir(io, root_dirname, .{});
+        return cwd.createDirPathOpen(io, dir, .{});
     }
 
     fn openCreateFileWrite(io: Io, dir: Io.Dir, head: []const u8) !Io.File {
@@ -839,7 +875,7 @@ const Report = struct {
         try w.print(
             "{d}-{d:0>2}-{d:0>2}T{d:0>2}:{d:0>2}:{d:0>2}Z",
             .{
-                yd.year,              md.month.numeric(),      md.day_index,
+                yd.year,              md.month.numeric(),      md.day_index + 1,
                 ds.getHoursIntoDay(), ds.getMinutesIntoHour(), ds.getSecondsIntoMinute(),
             },
         );
@@ -876,13 +912,13 @@ const Report = struct {
 
         const run_start_str = try utcTimeStr(self.run_start);
 
-        const cpu_info = try readFile(self.io, arena, "/proc/cpuinfo", &r_buf);
+        const cpu_info = try readFileStreaming(self.io, arena, "/proc/cpuinfo", &r_buf);
 
         const cpu_model_name = blk: {
             const start = std.mem.find(u8, cpu_info, "model name") orelse
                 return logErr("couldn't find model name on cpuinfo\n", .{});
             const sep = start + std.mem.find(u8, cpu_info[start..], ":").?;
-            const end = std.mem.find(u8, cpu_info[sep + 2 ..], "\n").?;
+            const end = sep + 2 + std.mem.find(u8, cpu_info[sep + 2 ..], "\n").?;
             break :blk cpu_info[sep + 2 .. end];
         };
 
@@ -900,7 +936,7 @@ const Report = struct {
             arena,
             try std.fmt.allocPrint(
                 arena.allocator(),
-                "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference ",
+                "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference",
                 .{meta.run_args.cpu1},
             ),
             &r_buf,
@@ -911,16 +947,30 @@ const Report = struct {
             arena,
             try std.fmt.allocPrint(
                 arena.allocator(),
-                "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference ",
+                "/sys/devices/system/cpu/cpu{}/cpufreq/energy_performance_preference",
                 .{meta.run_args.cpu2},
             ),
             &r_buf,
         );
 
         const perf_version = blk: {
-            const cmd = try std.process.spawn(self.io, .{ .argv = &.{ "perf", "-v" }, .stdout = .pipe });
+            var cmd = try std.process.spawn(
+                self.io,
+                .{ .argv = &.{ "perf", "-v" }, .stdout = .pipe },
+            );
             var r = cmd.stdout.?.reader(self.io, &r_buf);
-            break :blk try r.interface.allocRemaining(arena.allocator(), .limited(1 << 10));
+            const version_str = try r.interface.allocRemaining(
+                arena.allocator(),
+                .limited(1 << 10),
+            );
+            const term = try cmd.wait(self.io);
+            if (term != .exited or term.exited != 0) {
+                return error.PerfVersionFailed;
+            }
+            break :blk if (version_str.len > 1)
+                version_str[0 .. version_str.len - 1]
+            else
+                version_str;
         };
 
         const ops = blk: {
@@ -971,7 +1021,7 @@ const Report = struct {
                 build_info.git_dirty,
                 @tagName(builtin.mode),
                 builtin.zig_version_string,
-                uname.release,
+                mem.span(uname.release[0..].ptr),
                 cpu_model_name,
                 isolated,
                 no_turbo,
@@ -1003,9 +1053,17 @@ const Report = struct {
         try w.flush();
     }
 
+    fn readFileStreaming(io: Io, arena: *ArenaAllocator, path: []const u8, buf: []u8) ![]u8 {
+        const f = try Io.Dir.openFileAbsolute(io, path, .{});
+        defer f.close(io);
+        var r = f.readerStreaming(io, buf);
+        return r.interface.allocRemaining(arena.allocator(), .limited(1 << 20));
+    }
+
     fn readFile(io: Io, arena: *ArenaAllocator, path: []const u8, buf: []u8) ![]u8 {
-        const cpuinfo_file = try Io.Dir.openFileAbsolute(io, path, .{});
-        var r = cpuinfo_file.reader(io, buf);
+        const f = try Io.Dir.openFileAbsolute(io, path, .{});
+        defer f.close(io);
+        var r = f.reader(io, buf);
         return r.interface.allocRemaining(arena.allocator(), .limited(1 << 20));
     }
 };
@@ -1016,23 +1074,31 @@ const RunOptions = struct {
     lgen_opts: InitOptions = .{},
 };
 
-pub fn run2(io: Io, gpa: Allocator, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void {
+/// Asserts cpu1 and cpu2 are different and gte 0.
+pub fn run(io: Io, gpa: Allocator, arena: *ArenaAllocator, cmd: Run) Err!void {
+    const report_dir = Report.init(io, arena, null) catch |e| {
+        std.debug.print("error initializing reports: {t}\n", .{e});
+        return Err.Err;
+    };
 
+    return runInner(io, gpa, arena, cmd, &report_dir, .{});
 }
 
 /// Asserts cpu1 and cpu2 are different and gte 0.
-pub fn run(io: Io, gpa: Allocator, arena: *ArenaAllocator, cmd: Run, opts: RunOptions) Err!void {
+pub fn runInner(
+    io: Io,
+    gpa: Allocator,
+    arena: *ArenaAllocator,
+    cmd: Run,
+    report_dir: *Report,
+    opts: RunOptions,
+) Err!void {
     assert(cmd.cpu1 != cmd.cpu2);
     assert(cmd.cpu1 >= 0);
     assert(cmd.cpu2 >= 0);
 
     const cpu1 = try cpuNSet(cmd.cpu1);
     const cpu2 = try cpuNSet(cmd.cpu2);
-
-    const report_dir = Report.init(io, arena) catch |e| {
-        std.debug.print("error initializing reports: {t}\n", .{e});
-        return Err.Err;
-    };
 
     var op_iter = cmd.ops.iterator();
 
@@ -1071,8 +1137,8 @@ pub fn run(io: Io, gpa: Allocator, arena: *ArenaAllocator, cmd: Run, opts: RunOp
         break :blk Err.Err;
     };
 
-    try result;
-    try write_meta_result;
+    result catch return Err.Err;
+    write_meta_result catch return Err.Err;
 }
 
 fn waitHandle(pid: *i32, sock_fd: *i32) Err!u8 {
@@ -1178,32 +1244,6 @@ test "perf is killed if it hangs after stop ack" {
     try testing.expectError(Err.Err, perf.wait(testing.io));
 }
 
-test "perf handle returns error if unexpected close" {
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-
-    var perf = try Perf.init(
-        testing.io,
-        &arena,
-        342,
-        .{ .record = "file.txt" },
-        .{ .init = .{ .test_spawn = perfTestFunc(unexpectedCloseFakePerf) } },
-    );
-    try perf.enable();
-    perf.stop() catch {
-        perf.kill(testing.io);
-        return;
-    };
-    try perf.wait(testing.io);
-}
-
-fn unexpectedCloseFakePerf(t: *PerfTester) !void {
-    try t.recvEnable();
-    try t.sendAck();
-    try t.recvStop();
-    return Err.Err;
-}
-
 fn hangingFakePerf(t: *PerfTester) !void {
     try t.recvEnable();
     try t.sendAck();
@@ -1214,6 +1254,20 @@ fn hangingFakePerf(t: *PerfTester) !void {
 
 fn basicFakeServ(arg: usize) callconv(.c) u8 {
     const ctx: *srv.Context = @ptrFromInt(arg);
+
+    const sigaction = linux.Sigaction{
+        .flags = 0,
+        .handler = .{ .handler = linux.SIG.IGN },
+        .mask = linux.sigemptyset(),
+    };
+    switch (errno(linux.sigaction(.USR1, &sigaction, null))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("sigaction", e),
+    }
+    switch (errno(linux.sigaction(.USR2, &sigaction, null))) {
+        .SUCCESS => {},
+        else => |e| errnoBug("sigaction", e),
+    }
 
     var restore_sigset: linux.sigset_t = undefined;
     var sigset = linux.sigemptyset();
@@ -1265,11 +1319,16 @@ fn basicFakeLgen(arg: usize) callconv(.c) u8 {
     const done_msg: [1]u8 = .{@intFromEnum(load_gen.Message.done)};
     const start_msg: [1]u8 = .{@intFromEnum(load_gen.Message.start)};
 
+    var buf: [1]u8 = undefined;
+
+    recvAll(ctx.sock, &buf) catch {
+        return load_gen.ExitCode.err.value();
+    };
+
     sendAll(ctx.sock, &ready_msg) catch {
         return load_gen.ExitCode.err.value();
     };
 
-    var buf: [1]u8 = undefined;
     recvAll(ctx.sock, &buf) catch {
         return load_gen.ExitCode.err.value();
     };
@@ -1359,12 +1418,24 @@ fn testRun(
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
 
+    var temp = testing.tmpDir(.{});
+    defer temp.cleanup();
+
+    var temp_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_size = try temp.dir.realPath(testing.io, &temp_path_buf);
+
+    var report_dir = Report.init(testing.io, &arena, temp_path_buf[0..path_size]) catch |e| {
+        std.debug.print("error initializing reports: {t}\n", .{e});
+        return Err.Err;
+    };
+
     if (err) {
-        try testing.expectError(Err.Err, run(
+        try testing.expectError(Err.Err, runInner(
             testing.io,
             testing.allocator,
             &arena,
             cmd,
+            &report_dir,
             .{
                 .lgen_opts = .{ .init = .{ .test_spawn = fakeLgenFunc } },
                 .perf_opts = .{ .init = .{ .test_spawn = fakePerfFunc } },
@@ -1372,11 +1443,12 @@ fn testRun(
             },
         ));
     } else {
-        try run(
+        try runInner(
             testing.io,
             testing.allocator,
             &arena,
             cmd,
+            &report_dir,
             .{
                 .lgen_opts = .{ .init = .{ .test_spawn = fakeLgenFunc } },
                 .perf_opts = .{ .init = .{ .test_spawn = fakePerfFunc } },

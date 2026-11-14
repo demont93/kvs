@@ -1,6 +1,7 @@
 const std = @import("std");
 const linux = std.os.linux;
 const errno = linux.errno;
+const assert = std.debug.assert;
 
 pub const Err = error{Err};
 
@@ -215,6 +216,28 @@ pub fn killChild(pid: i32) void {
         .SUCCESS => {},
         else => |e| errnoBug("waitpid", e),
     }
+}
+
+pub fn closeRangeExcluding(excluded: i32) Err!void {
+    assert(excluded > 2);
+    assert(excluded > 0);
+
+    if (excluded != 3) {
+        try closeRange(3, excluded - 1);
+    }
+
+    try closeRange(excluded + 1, std.math.maxInt(i32));
+}
+
+pub fn closeRange(first: i32, last: i32) Err!void {
+    assert(first <= last);
+    assert(first >= 0);
+
+    try switch (errno(linux.close_range(first, last, .{ .CLOEXEC = false, .UNSHARE = false }))) {
+        .SUCCESS => {},
+        .MFILE, .NOMEM => |e| errnoUnexpectedErr("close_range", e),
+        else => |e| errnoBug("close_range", e),
+    };
 }
 
 pub fn errnoBug(call: []const u8, e: linux.E) noreturn {

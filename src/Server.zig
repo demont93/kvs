@@ -365,23 +365,7 @@ pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{O
     install_sig_handler();
 }
 
-pub fn listen_and_serve(
-    self: *Self,
-    addr: []const u8,
-) void {
-    self.bind(addr) catch |e| {
-        debug.print("failed to bind to address {s}: {s}\n", .{ addr, @errorName(e) });
-        return;
-    };
-
-    var localaddr: linux.sockaddr.in = undefined;
-    self.local_addr(&localaddr) catch |e| {
-        debug.print("failed to get local address: {s}\n", .{@errorName(e)});
-        return;
-    };
-
-    debug.print("Listening and serving on {s}\n", .{format_addr(localaddr)});
-
+pub fn serve(self: *Self) void {
     var diag: ConnectionDiagnostics = undefined;
 
     while (true) {
@@ -416,7 +400,28 @@ pub fn listen_and_serve(
     }
 }
 
-fn bind(self: *Self, addr: []const u8) Listener.BindError!void {
+pub fn listen_and_serve(
+    self: *Self,
+    addr: []const u8,
+) void {
+    self.bind(addr) catch |e| {
+        debug.print("failed to bind to address {s}: {s}\n", .{ addr, @errorName(e) });
+        return;
+    };
+
+    var localaddr: linux.sockaddr.in = undefined;
+    self.local_addr(&localaddr) catch |e| {
+        debug.print("failed to get local address: {s}\n", .{@errorName(e)});
+        return;
+    };
+
+    const addr_str = format_addr(localaddr);
+    debug.print("Listening and serving on {s}\n", .{std.mem.span(addr_str[0..].ptr)});
+
+    self.serve();
+}
+
+pub fn bind(self: *Self, addr: []const u8) Listener.BindError!void {
     return self.listener.bind(addr);
 }
 

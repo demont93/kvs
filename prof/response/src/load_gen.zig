@@ -41,6 +41,7 @@ pub const Message = enum(u8) {
     done = 1,
     start = 2,
     err = 3,
+    connect = 4,
 };
 
 pub const ExitCode = enum(u8) {

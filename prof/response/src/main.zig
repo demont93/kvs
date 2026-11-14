@@ -24,7 +24,7 @@ pub fn main(init: std.process.Init) !void {
                 .seed = cli_args.seed,
             };
 
-            try runner.run(init.io, init.gpa, init.arena, parsed, .{});
+            try runner.run(init.io, init.gpa, init.arena, parsed);
         },
     };
 }
