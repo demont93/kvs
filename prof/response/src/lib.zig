@@ -114,7 +114,12 @@ fn destroyStack(stack: []u8) void {
 pub fn socketPair() Err![2]i32 {
     var socks: [2]i32 = undefined;
 
-    try switch (errno(linux.socketpair(linux.AF.UNIX, linux.SOCK.STREAM, 0, &socks))) {
+    try switch (errno(linux.socketpair(
+        linux.AF.UNIX,
+        linux.SOCK.STREAM | linux.SOCK.CLOEXEC,
+        0,
+        &socks,
+    ))) {
         .SUCCESS => {},
         .OPNOTSUPP,
         .PROTONOSUPPORT,
