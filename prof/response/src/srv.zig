@@ -229,7 +229,7 @@ fn snapshotAllocations(s: linux.SIG) callconv(.c) void {
 }
 
 fn sendReport(sock: i32, report: *const Report) !void {
-    const report_buf: *const [@sizeOf(Report)]u8 = @ptrCast(&report);
+    const report_buf: *const [@sizeOf(Report)]u8 = @ptrCast(report);
     try lib.sendAll(sock, report_buf);
 }
 
