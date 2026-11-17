@@ -165,11 +165,6 @@ pub fn build(b: *std.Build) void {
     // Lastly, the Zig build system is relatively simple and self-contained,
     // and reading its source code will allow you to master it.
 
-    // Compile tests without running.
-    const check_step = b.step("check", "Check compile");
-    check_step.dependOn(&mod_tests.step);
-    check_step.dependOn(&exe_tests.step);
-
     const build_info = b.addOptions();
 
     const git_hash = std.mem.trim(u8, b.run(&.{ "git", "rev-parse", "--short", "HEAD" }), "\n");
@@ -188,7 +183,10 @@ pub fn build(b: *std.Build) void {
             .target = target,
             .optimize = b.standardOptimizeOption(.{ .preferred_optimize_mode = .ReleaseFast }),
             .omit_frame_pointer = false,
-            .imports = &.{ .{ .name = "kvs", .module = mod }, .{ .name = "build_info", .module = build_info.createModule() } },
+            .imports = &.{
+                .{ .name = "kvs", .module = mod },
+                .{ .name = "build_info", .module = build_info.createModule() },
+            },
         }),
     });
 
@@ -215,4 +213,55 @@ pub fn build(b: *std.Build) void {
     );
     profile_response_test_step.dependOn(&run_profile_response_tests.step);
     profile_response_test_step.dependOn(&install_profile_response_tests.step);
+
+    check(
+        b,
+        test_filters,
+        profile_response.root_module,
+        exe.root_module,
+        mod,
+    );
+}
+
+fn check(
+    b: *std.Build,
+    filters: []const []const u8,
+    check_profile_response_root_module: *std.Build.Module,
+    exe_root_module: *std.Build.Module,
+    kvs_mod: *std.Build.Module,
+) void {
+    const check_profile_response = b.addExecutable(.{
+        .name = "profile-response",
+        .root_module = check_profile_response_root_module,
+    });
+
+    const check_profile_response_tests = b.addTest(.{
+        .root_module = check_profile_response_root_module,
+        .use_llvm = true,
+        .filters = filters,
+    });
+
+    const check_exe = b.addExecutable(.{
+        .name = "kvs",
+        .root_module = exe_root_module,
+    });
+
+    const check_exe_tests = b.addTest(.{
+        .root_module = exe_root_module,
+        .use_llvm = true,
+        .filters = filters,
+    });
+
+    const kvs_tests = b.addTest(.{
+        .root_module = kvs_mod,
+        .use_llvm = true,
+        .filters = filters,
+    });
+
+    const check_step = b.step("check", "");
+    check_step.dependOn(&check_profile_response.step);
+    check_step.dependOn(&check_profile_response_tests.step);
+    check_step.dependOn(&check_exe.step);
+    check_step.dependOn(&check_exe_tests.step);
+    check_step.dependOn(&kvs_tests.step);
 }

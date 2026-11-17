@@ -16,7 +16,7 @@ const lib = @import("lib.zig");
 const errnoBug = lib.errnoBug;
 const logErr = lib.logErr;
 const Err = lib.Err;
-const load_gen = @import("load_gen.zig");
+const LoadGen = @import("LoadGen.zig");
 const srv = @import("srv.zig");
 
 pub const Run = struct {
@@ -29,7 +29,7 @@ pub const Run = struct {
     ops: Ops,
 };
 
-pub const Ops = std.EnumSet(load_gen.Op);
+pub const Ops = std.EnumSet(LoadGen.Op);
 
 const MeasurementType = enum {
     profile,
@@ -53,7 +53,7 @@ const Measurement = struct {
         cpu2: linux.cpu_set_t,
         measurement_type: MeasurementType,
         measurement_dir: *Report.MeasurementDir,
-        workload: load_gen.Workload,
+        workload: LoadGen.Workload,
         lgen_init: InitOptions,
         serv_init: InitOptions,
         perf_init: InitOptions,
@@ -68,7 +68,7 @@ const Measurement = struct {
         self.measurement_type = opts.measurement_type;
         self.measurement_dir = opts.measurement_dir;
 
-        self.lg_handle = try LoadGenHandle.init(opts.cpu1, opts.workload, opts.lgen_init);
+        self.lg_handle = try LoadGenHandle.init(opts.cpu1, opts.port, opts.workload, opts.lgen_init);
 
         self.server_handle = ServerHandle.init(
             opts.port,
@@ -334,21 +334,23 @@ const LoadGenHandle = struct {
 
     fn init(
         cpu: linux.cpu_set_t,
-        workload: load_gen.Workload,
+        port: u16,
+        workload: LoadGen.Workload,
         opts: InitOptions,
     ) Err!LoadGenHandle {
         errdefer logErr("opening load generator\n", .{}) catch {};
 
         const socks = try lib.socketPair();
 
-        const ctx: load_gen.Context = .{
+        const ctx: LoadGen.Context = .{
             .cpu = cpu,
             .sock = socks[1],
             .workload = workload,
+            .port = port,
         };
 
         const spawn_func = switch (opts.init) {
-            .default => &load_gen.processMain,
+            .default => &LoadGen.processMain,
             .test_spawn => |v| v,
         };
 
@@ -380,7 +382,7 @@ const LoadGenHandle = struct {
     fn connect(self: *LoadGenHandle) Err!void {
         errdefer logErr("sending connect to load generator\n", .{}) catch {};
 
-        const msg = @intFromEnum(load_gen.Message.connect);
+        const msg = @intFromEnum(LoadGen.Message.connect);
         try sendAll(self.sock, @as(*const [1]u8, &msg));
     }
 
@@ -399,16 +401,16 @@ const LoadGenHandle = struct {
     fn start(self: *LoadGenHandle) Err!void {
         errdefer logErr("starting load generator\n", .{}) catch {};
 
-        const msg = @intFromEnum(load_gen.Message.start);
+        const msg = @intFromEnum(LoadGen.Message.start);
         try sendAll(self.sock, @as(*const [1]u8, &msg));
     }
 
-    fn recvCode(self: *LoadGenHandle) Err!load_gen.Message {
+    fn recvCode(self: *LoadGenHandle) Err!LoadGen.Message {
         var buf: [1]u8 = undefined;
 
         recvAll(self.sock, &buf) catch return Err.Err;
 
-        const msg = std.enums.fromInt(load_gen.Message, buf[0]) orelse
+        const msg = std.enums.fromInt(LoadGen.Message, buf[0]) orelse
             panic("invalid message from load generator: {}\n", .{buf[0]});
 
         return switch (msg) {
@@ -417,7 +419,7 @@ const LoadGenHandle = struct {
         };
     }
 
-    fn invalidMessageReceived(msg: load_gen.Message) noreturn {
+    fn invalidMessageReceived(msg: LoadGen.Message) noreturn {
         panic("invalid message from load generator: {t}", .{msg});
     }
 
@@ -425,7 +427,7 @@ const LoadGenHandle = struct {
         errdefer logErr("waiting for load generator pid\n", .{}) catch {};
 
         const code = waitHandle(&self.pid, &self.sock) catch return Err.Err;
-        switch (@as(load_gen.ExitCode, @enumFromInt(code))) {
+        switch (@as(LoadGen.ExitCode, @enumFromInt(code))) {
             .success => {},
             .err => return logErr("received err exit code\n", .{}),
         }
@@ -784,7 +786,7 @@ const Report = struct {
             io: Io,
             allocator: Allocator,
             reports_dir: Io.Dir,
-            op: load_gen.Op,
+            op: LoadGen.Op,
         ) !MeasurementDir {
             const head = op.formatted();
             try reports_dir.createDir(io, head, .default_dir);
@@ -846,7 +848,7 @@ const Report = struct {
         };
     }
 
-    fn measurementDir(self: Report, allocator: Allocator, op: load_gen.Op) !MeasurementDir {
+    fn measurementDir(self: Report, allocator: Allocator, op: LoadGen.Op) !MeasurementDir {
         return .init(self.io, allocator, self.dir, op);
     }
 
@@ -1076,7 +1078,7 @@ const RunOptions = struct {
 
 /// Asserts cpu1 and cpu2 are different and gte 0.
 pub fn run(io: Io, gpa: Allocator, arena: *ArenaAllocator, cmd: Run) Err!void {
-    const report_dir = Report.init(io, arena, null) catch |e| {
+    var report_dir = Report.init(io, arena, null) catch |e| {
         std.debug.print("error initializing reports: {t}\n", .{e});
         return Err.Err;
     };
@@ -1313,34 +1315,34 @@ fn basicFakeServ(arg: usize) callconv(.c) u8 {
 }
 
 fn basicFakeLgen(arg: usize) callconv(.c) u8 {
-    const ctx: *load_gen.Context = @ptrFromInt(arg);
+    const ctx: *LoadGen.Context = @ptrFromInt(arg);
 
-    const ready_msg: [1]u8 = .{@intFromEnum(load_gen.Message.ready)};
-    const done_msg: [1]u8 = .{@intFromEnum(load_gen.Message.done)};
-    const start_msg: [1]u8 = .{@intFromEnum(load_gen.Message.start)};
+    const ready_msg: [1]u8 = .{@intFromEnum(LoadGen.Message.ready)};
+    const done_msg: [1]u8 = .{@intFromEnum(LoadGen.Message.done)};
+    const start_msg: [1]u8 = .{@intFromEnum(LoadGen.Message.start)};
 
     var buf: [1]u8 = undefined;
 
     recvAll(ctx.sock, &buf) catch {
-        return load_gen.ExitCode.err.value();
+        return LoadGen.ExitCode.err.value();
     };
 
     sendAll(ctx.sock, &ready_msg) catch {
-        return load_gen.ExitCode.err.value();
+        return LoadGen.ExitCode.err.value();
     };
 
     recvAll(ctx.sock, &buf) catch {
-        return load_gen.ExitCode.err.value();
+        return LoadGen.ExitCode.err.value();
     };
     testing.expectEqualSlices(u8, &start_msg, &buf) catch {
-        return load_gen.ExitCode.err.value();
+        return LoadGen.ExitCode.err.value();
     };
 
     sendAll(ctx.sock, &done_msg) catch {
-        return load_gen.ExitCode.err.value();
+        return LoadGen.ExitCode.err.value();
     };
 
-    return load_gen.ExitCode.success.value();
+    return LoadGen.ExitCode.success.value();
 }
 
 fn perfTestFunc(

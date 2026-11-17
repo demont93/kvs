@@ -1,5 +1,5 @@
 const std = @import("std");
-const load_gen = @import("load_gen.zig");
+const LoadGen = @import("LoadGen.zig");
 const Io = std.Io;
 const ArenaAllocator = std.heap.ArenaAllocator;
 const Args = std.process.Args;
@@ -21,7 +21,7 @@ const CommandSpec = union(enum) {
         pub const requests: FieldSpec(u64) = .{ .short = 'r' };
         pub const @"key-count": FieldSpec(u64) = .{ .short = 'k' };
         pub const seed: FieldSpec(u64) = .{ .short = 's' };
-        pub const op: FieldSpec(load_gen.Op) = .{ .short = 'o' };
+        pub const op: FieldSpec(LoadGen.Op) = .{ .short = 'o' };
 
         fn validate(cmd: anytype) !void {
             if (cmd.cpu1 == cmd.cpu2) {
@@ -386,5 +386,5 @@ test "parse full command" {
     try testing.expectEqual(234, out.run.@"key-count");
     try testing.expectEqual(234234, out.run.seed);
     try testing.expectEqual(1, out.run.requests);
-    try testing.expectEqual(load_gen.Op.get_hit, out.run.op);
+    try testing.expectEqual(LoadGen.Op.get_hit, out.run.op);
 }

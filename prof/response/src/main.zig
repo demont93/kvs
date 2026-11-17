@@ -33,5 +33,5 @@ test {
     _ = @import("runner.zig");
     _ = @import("Cli.zig");
     _ = @import("srv.zig");
-    _ = @import("load_gen.zig");
+    _ = @import("LoadGen.zig");
 }

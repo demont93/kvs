@@ -23,6 +23,9 @@ const syscall = @import("syscall.zig");
 
 const Self = @This();
 
+pub const max_key_size = protocol.max_key_size;
+pub const max_value_size = protocol.max_value_size;
+
 const retry_connect_delay: Duration = .fromMilliseconds(100);
 const retry_connect_delay_cap: Duration = .fromMilliseconds(500);
 
