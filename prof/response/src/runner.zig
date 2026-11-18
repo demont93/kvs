@@ -525,7 +525,7 @@ const Perf = struct {
                 .default => {
                     switch (op) {
                         .record => |v| {
-                            const args = recordArgs(
+                            const args = defaultRecordArgs(
                                 try pidStr(arena, pid),
                                 try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
                                 v,
@@ -535,7 +535,7 @@ const Perf = struct {
                             };
                         },
                         .trace => |v| {
-                            const args = traceArgs(
+                            const args = defaultTraceArgs(
                                 try pidStr(arena, pid),
                                 try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
                                 v,
@@ -574,7 +574,7 @@ const Perf = struct {
         };
     }
 
-    fn recordArgs(
+    fn defaultRecordArgs(
         pid_str: []const u8,
         ctl_fd_str: []const u8,
         filename: []const u8,
@@ -592,7 +592,11 @@ const Perf = struct {
         };
     }
 
-    fn traceArgs(pid_str: []const u8, ctl_fd_str: []const u8, filename: []const u8) [11][]const u8 {
+    fn defaultTraceArgs(
+        pid_str: []const u8,
+        ctl_fd_str: []const u8,
+        filename: []const u8,
+    ) [11][]const u8 {
         return [_][]const u8{
             "perf",
             "stat",
