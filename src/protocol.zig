@@ -268,8 +268,8 @@ pub const encode = struct {
         val: []const u8,
         bufs: *[3][]const u8,
     ) void {
-        mem.writeInt(u32, frame[0..4], @intCast(key.len), .big);
-        mem.writeInt(u32, frame[4..8], @intCast(val.len), .big);
+        mem.writeInt(u32, frame[0..4], @intCast(key.len+val.len), .big);
+        mem.writeInt(u32, frame[4..8], @intCast(key.len), .big);
         frame[8] = @intFromEnum(op);
 
         bufs[0] = frame;

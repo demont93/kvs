@@ -230,7 +230,6 @@ fn parseFlag(
             } else {
                 maybe_flag = inline for (comptime std.meta.tags(FlagEnum)) |flag_enum| {
                     const FlagParser = @FieldType(FlagsetParser, @tagName(flag_enum));
-                    // const Spec = FlagType.Spec;
                     const spec = FlagParser.spec;
                     if (spec.short) |c| {
                         if (key[1] == c) break flag_enum;
@@ -309,6 +308,7 @@ fn printHelp(self: *Self) void {
         \\  Commands:
         \\
         \\    - run 
+        \\        -p, --port      Port to use for the test
         \\        -1, --cpu1      Core to pin the load generator to
         \\        -2, --cpu2      Core to pin the server to
         \\        -k, --key-count Amount of keys to preload kvs with

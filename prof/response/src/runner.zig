@@ -126,8 +126,8 @@ const Measurement = struct {
             _ = try poll(&poll_fds);
 
             try perf.stop();
-            self.server_handle.end(self.measurement_type);
             try self.lg_handle.awaitDone();
+            self.server_handle.end(self.measurement_type);
 
             switch (self.measurement_type) {
                 .profile => {},
@@ -440,7 +440,7 @@ const LoadGenHandle = struct {
 };
 
 const Perf = struct {
-    const ack = "ack\n";
+    const ack = "ack\n" ++ .{0};
 
     child_proc: process.Child,
     ack_pipe: i32,
@@ -523,21 +523,28 @@ const Perf = struct {
 
             switch (opts.init) {
                 .default => {
-                    const args = switch (op) {
-                        .record => |v| recordArgs(
-                            try pidStr(arena, pid),
-                            try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
-                            v,
-                        ),
-                        .trace => |v| traceArgs(
-                            try pidStr(arena, pid),
-                            try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
-                            v,
-                        ),
-                    };
-                    break :blk process.spawn(io, .{ .argv = &args }) catch |err| switch (err) {
-                        else => |e| return logErr("failed to spawn perf: {t}\n", .{e}),
-                    };
+                    switch (op) {
+                        .record => |v| {
+                            const args = recordArgs(
+                                try pidStr(arena, pid),
+                                try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
+                                v,
+                            );
+                            break :blk process.spawn(io, .{ .argv = &args }) catch |err| switch (err) {
+                                else => |e| return logErr("failed to spawn perf: {t}\n", .{e}),
+                            };
+                        },
+                        .trace => |v| {
+                            const args = traceArgs(
+                                try pidStr(arena, pid),
+                                try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
+                                v,
+                            );
+                            break :blk process.spawn(io, .{ .argv = &args }) catch |err| switch (err) {
+                                else => |e| return logErr("failed to spawn perf: {t}\n", .{e}),
+                            };
+                        },
+                    }
                 },
                 .test_spawn => |v| {
                     const ctx: TestCtx = .{
@@ -571,13 +578,11 @@ const Perf = struct {
         pid_str: []const u8,
         ctl_fd_str: []const u8,
         filename: []const u8,
-    ) [11][]const u8 {
+    ) [9][]const u8 {
         return [_][]const u8{
             "perf",
             "record",
             "-g",
-            "-e",
-            "cycles",
             "-p",
             pid_str,
             "--delay=-1",
@@ -606,8 +611,10 @@ const Perf = struct {
     fn wait(self: *Perf, io: Io) Err!void {
         errdefer logErr("waiting for perf pid\n", .{}) catch {};
 
-        lib.closeFdLog(self.ack_pipe);
-        const write_pipe_close_result = lib.closeFd(self.ctl_pipe);
+        switch (errno(linux.kill(self.child_proc.id.?, linux.SIG.INT))) {
+            .SUCCESS => {},
+            else => |e| errnoBug("kill", e),
+        }
 
         // There is a gap on the current standard where if io gets canceled, it leaks the
         // process. Store the pid and signal it on error to avoid leaks.
@@ -635,9 +642,12 @@ const Perf = struct {
             return error.Err;
         };
 
+        lib.closeFdLog(self.ack_pipe);
+        const write_pipe_close_result = lib.closeFd(self.ctl_pipe);
+
         switch (termination) {
             .exited => |v| if (v != 0) return logErr("perf exited with error\n", .{}),
-            .signal => |v| return logErr("perf exited with signal: {t}\n", .{v}),
+            .signal => |v| if (v != .INT) return logErr("perf exited with signal: {t}\n", .{v}),
             else => return logErr("perf exited ungracefully\n", .{}),
         }
         try write_pipe_close_result;
@@ -656,7 +666,7 @@ const Perf = struct {
         s.concurrent(
             .timeout,
             Io.sleep,
-            .{ io, .fromSeconds(5), .awake },
+            .{ io, .fromSeconds(10), .awake },
         ) catch |e| panic("{t}\n", .{e});
 
         s.concurrent(
@@ -699,7 +709,7 @@ const Perf = struct {
 
     fn stop(self: *Perf) !void {
         errdefer logErr("stopping perf\n", .{}) catch {};
-        try self.send_msg("stop");
+        try self.send_msg("disable");
     }
 
     fn send_msg(self: *Perf, msg: []const u8) Err!void {

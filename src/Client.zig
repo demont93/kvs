@@ -155,10 +155,10 @@ pub fn init(
     self.sock_fd = -1;
     self.timeout = opts.timeout;
     self.idle_timeout = opts.idle_timeout;
-    self.max_attempts = if (opts.max_attempts >= 1)
-        opts.max_attempts
-    else
+    if (opts.max_attempts < 1) {
         std.debug.panic("invalid client max attempts {} must be >= 1\n", .{opts.max_attempts});
+    }
+    self.max_attempts = opts.max_attempts;
 }
 
 pub const GetError = protocol.encode.KeyError || RequestError;

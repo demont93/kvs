@@ -373,7 +373,12 @@ pub fn serve(self: *Self) void {
             self.retry_state.reset();
             break :blk conn;
         } else |err| {
-            debug.print("error accepting connection: {s}\n", .{@errorName(err)});
+            if (err == error.Stop) {
+                std.debug.print("stopping the server\n", .{});
+            } else {
+                debug.print("error accepting connection: {s}\n", .{@errorName(err)});
+            }
+
             switch (err) {
                 error.InsufficientMemory, error.TooManyOpenFiles => self.retry_state.wait(self.io),
                 error.Stop => return,
@@ -390,7 +395,7 @@ pub fn serve(self: *Self) void {
                     "connection error: unexpected {t}",
                     .{self.unexpected_errno},
                 ),
-                error.Stop => return log("request stopped", .{}),
+                error.Stop => return log("request stopped\n", .{}),
                 else => debug.print(
                     "connection error {t} while {s}\n",
                     .{ diag.details, diag.action.description() },
@@ -691,6 +696,7 @@ fn read_buffered(
                     error.Intr => continue,
                     else => |e2| return e2,
                 };
+                break;
             }
 
             n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {

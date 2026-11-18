@@ -161,11 +161,11 @@ const OpPermute = struct {
     fn maxKeys(op: Op, key_count: usize, requests: usize) usize {
         return switch (op) {
             .get_hit => key_count,
-            .get_miss => key_count,
+            .get_miss => key_count * 2,
             .set_insert => key_count + requests,
             .set_replace => key_count,
             .delete_hit => key_count + requests,
-            .delete_miss => key_count,
+            .delete_miss => key_count * 2,
         };
     }
 };
@@ -369,11 +369,11 @@ fn run(self: *Self) !void {
 
     switch (self.workload.operation) {
         .get_hit => try self.getHit(OpPermute.warmupIdx),
-        .get_miss => try self.prepareGetMiss(OpPermute.warmupIdx),
-        .set_insert => try self.prepareSetInsert(OpPermute.warmupIdx),
-        .set_replace => try self.prepareSetReplace(OpPermute.warmupIdx),
-        .delete_hit => try self.prepareDeleteHit(OpPermute.warmupIdx),
-        .delete_miss => try self.prepareDeleteMiss(OpPermute.warmupIdx),
+        .get_miss => try self.getMiss(OpPermute.warmupIdx),
+        .set_insert => try self.setInsert(OpPermute.warmupIdx),
+        .set_replace => try self.setReplace(OpPermute.warmupIdx),
+        .delete_hit => try self.deleteHit(OpPermute.warmupIdx),
+        .delete_miss => try self.deleteMiss(OpPermute.warmupIdx),
     }
 
     try self.sendMsg(.ready);
@@ -381,11 +381,11 @@ fn run(self: *Self) !void {
 
     switch (self.workload.operation) {
         .get_hit => try self.getHit(OpPermute.measureIdx),
-        .get_miss => try self.prepareGetMiss(OpPermute.measureIdx),
-        .set_insert => try self.prepareSetInsert(OpPermute.measureIdx),
-        .set_replace => try self.prepareSetReplace(OpPermute.measureIdx),
-        .delete_hit => try self.prepareDeleteHit(OpPermute.measureIdx),
-        .delete_miss => try self.prepareDeleteMiss(OpPermute.measureIdx),
+        .get_miss => try self.getMiss(OpPermute.measureIdx),
+        .set_insert => try self.setInsert(OpPermute.measureIdx),
+        .set_replace => try self.setReplace(OpPermute.measureIdx),
+        .delete_hit => try self.deleteHit(OpPermute.measureIdx),
+        .delete_miss => try self.deleteMiss(OpPermute.measureIdx),
     }
 
     try self.sendMsg(.done);
@@ -416,7 +416,7 @@ fn getHit(self: *Self, mapFn: OpPermute.MapFn) !void {
     }
 }
 
-fn prepareGetMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
+fn getMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
     var alloc: heap.FixedBufferAllocator = .init(&self.inc_value);
 
     for (0..self.workload.requests) |i| {
@@ -426,19 +426,14 @@ fn prepareGetMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
         var r = try self.client.get(alloc.allocator(), &self.out_key);
         defer r.deinit(alloc.allocator());
 
-        if (r.code != .Ok) {
+        if (r.code != .NotFound) {
             std.debug.print("got {t} while doing warmup\n", .{r.code});
-            return error.Err;
-        }
-
-        if (!mem.eql(u8, r.value, &self.out_value)) {
-            std.debug.print("got unexpected value: {s}, expected: {s}\n", .{ r.value, &self.out_value });
             return error.Err;
         }
     }
 }
 
-fn prepareSetInsert(self: *Self, mapFn: OpPermute.MapFn) !void {
+fn setInsert(self: *Self, mapFn: OpPermute.MapFn) !void {
     try self.preload();
 
     for (0..self.workload.requests) |i| {
@@ -454,7 +449,7 @@ fn prepareSetInsert(self: *Self, mapFn: OpPermute.MapFn) !void {
     }
 }
 
-fn prepareSetReplace(self: *Self, mapFn: OpPermute.MapFn) !void {
+fn setReplace(self: *Self, mapFn: OpPermute.MapFn) !void {
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
         self.gen.entry(idx, &self.out_key, &self.out_value);
@@ -468,7 +463,7 @@ fn prepareSetReplace(self: *Self, mapFn: OpPermute.MapFn) !void {
     }
 }
 
-fn prepareDeleteHit(self: *Self, mapFn: OpPermute.MapFn) !void {
+fn deleteHit(self: *Self, mapFn: OpPermute.MapFn) !void {
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
         self.gen.entry(idx, &self.out_key, &self.out_value);
@@ -482,14 +477,14 @@ fn prepareDeleteHit(self: *Self, mapFn: OpPermute.MapFn) !void {
     }
 }
 
-fn prepareDeleteMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
+fn deleteMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
         self.gen.entry(idx, &self.out_key, &self.out_value);
 
         var r = try self.client.del(&self.out_key);
 
-        if (r.code != .Ok) {
+        if (r.code != .NotFound) {
             std.debug.print("got {t} while doing warmup\n", .{r.code});
             return error.Err;
         }
