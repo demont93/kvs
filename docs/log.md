@@ -24,3 +24,7 @@ In order to measure the next steps and take informed decisions, the next logical
 ## FSM on client
 
 Implemented an FSM on the client to manage all the different states in which the connection can be. Before the fsm, the conditions where all over the place for retrying, errors, state of the connection. The FSM made it easy to have all the state that decides the next transition in one place.
+
+## mmap in Set-Insert
+
+The Set-Insert run showed 978 mmap and 978 munmap calls for 500k requests, which no other op had. Recording syscalls:sys_enter_mmap with call stacks put all of them under BufMap.put → BufMap.copy → SmpAllocator.alloc. They don’t come from the map resizing. They come from copying each key and value into its own allocation. 500k puts with 2 copies each is 1M allocations of 64 bytes, which works out to one mmap per about 1024 allocations: SmpAllocator mapping a new fixed-size 64 KiB slab whenever a size class runs out. Fixed slabs keep the cost of each refill constant and the waste bounded, at the price of more syscalls in total. At one mmap per ~1000 puts that cost is negligible next to the 4 syscalls per request. It goes away anyway if the parsed buffer is handed to the map instead of copied.
