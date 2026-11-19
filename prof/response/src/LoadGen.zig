@@ -434,8 +434,6 @@ fn getMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
 }
 
 fn setInsert(self: *Self, mapFn: OpPermute.MapFn) !void {
-    try self.preload();
-
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
         self.gen.entry(idx, &self.out_key, &self.out_value);
