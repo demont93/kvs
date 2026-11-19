@@ -23,6 +23,7 @@ const CommandSpec = union(enum) {
         pub const @"key-count": FieldSpec(u64) = .{ .short = 'k' };
         pub const seed: FieldSpec(u64) = .{ .short = 's' };
         pub const ops: FieldSpec(std.enums.EnumSet(LoadGen.Op)) = .{ .short = 'o' };
+        pub const @"p-args": FieldSpec(?[]u8) = .{};
 
         fn validate(cmd: anytype) !void {
             if (cmd.cpu1 == cmd.cpu2) {
@@ -264,7 +265,7 @@ fn parseFlag(
 
 fn parseValue(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
     return switch (@typeInfo(T)) {
-        .optional => |o| parseScalar(o.child, arena, args),
+        .optional => |o| try parseScalar(o.child, arena, args),
         else => parseScalar(T, arena, args),
     };
 }

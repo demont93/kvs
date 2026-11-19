@@ -27,6 +27,7 @@ pub const Run = struct {
     cpu2: i32,
     port: u16,
     ops: Ops,
+    p_args: []const u8,
 };
 
 pub const Ops = std.EnumSet(LoadGen.Op);
@@ -46,6 +47,7 @@ const Measurement = struct {
     lg_handle: LoadGenHandle,
     measurement_type: MeasurementType,
     measurement_dir: *Report.MeasurementDir,
+    p_args: []const u8,
 
     const Options = struct {
         port: u16,
@@ -53,6 +55,7 @@ const Measurement = struct {
         cpu2: linux.cpu_set_t,
         measurement_type: MeasurementType,
         measurement_dir: *Report.MeasurementDir,
+        p_args: []const u8,
         workload: LoadGen.Workload,
         lgen_init: InitOptions,
         serv_init: InitOptions,
@@ -67,6 +70,7 @@ const Measurement = struct {
 
         self.measurement_type = opts.measurement_type;
         self.measurement_dir = opts.measurement_dir;
+        self.p_args = opts.p_args;
 
         self.lg_handle = try LoadGenHandle.init(opts.cpu1, opts.port, opts.workload, opts.lgen_init);
 
@@ -102,7 +106,10 @@ const Measurement = struct {
 
         const perf_op: Perf.OpArgs = switch (self.measurement_type) {
             .count => .{ .trace = try self.measurement_dir.traceFilename() },
-            .profile => .{ .record = try self.measurement_dir.recordFilename() },
+            .profile => .{ .record = .{
+                .filename = try self.measurement_dir.recordFilename(),
+                .p_args = self.p_args,
+            } },
         };
 
         var perf = try Perf.init(io, arena, self.server_handle.pid, perf_op, perf_opts);
@@ -495,7 +502,10 @@ const Perf = struct {
     const Op = enum { record, trace };
 
     const OpArgs = union(Op) {
-        record: []const u8,
+        record: struct {
+            filename: []const u8,
+            p_args: []const u8,
+        },
         trace: []const u8,
     };
 
@@ -525,17 +535,20 @@ const Perf = struct {
                 .default => {
                     switch (op) {
                         .record => |v| {
-                            const args = defaultRecordArgs(
+                            const args = recordArgs(
+                                arena,
                                 try pidStr(arena, pid),
                                 try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
-                                v,
-                            );
-                            break :blk process.spawn(io, .{ .argv = &args }) catch |err| switch (err) {
+                                v.filename,
+                                v.p_args,
+                            ) catch |err| return logErr("error creating perf record args: {t}\n", .{err});
+
+                            break :blk process.spawn(io, .{ .argv = args }) catch |err| switch (err) {
                                 else => |e| return logErr("failed to spawn perf: {t}\n", .{e}),
                             };
                         },
                         .trace => |v| {
-                            const args = defaultTraceArgs(
+                            const args = traceArgs(
                                 try pidStr(arena, pid),
                                 try controlFdArg(arena, pipe_pairs.their_r, pipe_pairs.their_w),
                                 v,
@@ -574,12 +587,14 @@ const Perf = struct {
         };
     }
 
-    fn defaultRecordArgs(
+    fn recordArgs(
+        arena: *ArenaAllocator,
         pid_str: []const u8,
         ctl_fd_str: []const u8,
         filename: []const u8,
-    ) [9][]const u8 {
-        return [_][]const u8{
+        p_args: []const u8,
+    ) ![][]const u8 {
+        const default = [_][]const u8{
             "perf",
             "record",
             "-g",
@@ -590,9 +605,19 @@ const Perf = struct {
             "-o",
             filename,
         };
+
+        var lst = try std.ArrayList([]const u8).initCapacity(arena.allocator(), default.len);
+        try lst.appendSlice(arena.allocator(), &default);
+
+        var it = mem.tokenizeScalar(u8, p_args, ' ');
+        while (it.next()) |tok| {
+            try lst.append(arena.allocator(), tok);
+        }
+
+        return lst.items;
     }
 
-    fn defaultTraceArgs(
+    fn traceArgs(
         pid_str: []const u8,
         ctl_fd_str: []const u8,
         filename: []const u8,
@@ -1138,6 +1163,7 @@ pub fn runInner(
                 .lgen_init = opts.lgen_opts,
                 .serv_init = opts.serv_opts,
                 .perf_init = opts.perf_opts,
+                .p_args = cmd.p_args,
             }) catch |e| {
                 logErr("{t} {t} measurement failed\n", .{ op, measurement_type }) catch {};
                 break :rslt e;
@@ -1239,6 +1265,7 @@ test "happy path" {
         .key_count = 500,
         .seed = 2349834,
         .ops = .initOne(.delete_hit),
+        .p_args = &.{},
     };
     try testRun(run_cmd, &basicFakeServ, &basicFakeLgen, &basicFakePerf, false);
 }
@@ -1251,7 +1278,7 @@ test "perf is killed if it hangs after stop ack" {
         testing.io,
         &arena,
         34,
-        .{ .record = "file.txt" },
+        .{ .record = .{ .filename = "file.txt", .p_args = &.{} } },
         .{ .init = .{ .test_spawn = perfTestFunc(hangingFakePerf) } },
     );
 
