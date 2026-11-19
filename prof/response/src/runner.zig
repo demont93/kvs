@@ -45,32 +45,41 @@ const Measurement = struct {
 
     server_handle: ServerHandle,
     lg_handle: LoadGenHandle,
+    perf: Perf,
+
     measurement_type: MeasurementType,
     measurement_dir: *Report.MeasurementDir,
-    p_args: []const u8,
+    io: Io,
 
     const Options = struct {
         port: u16,
         cpu1: linux.cpu_set_t,
         cpu2: linux.cpu_set_t,
-        measurement_type: MeasurementType,
+        measurement_type: MeasurementOption,
         measurement_dir: *Report.MeasurementDir,
-        p_args: []const u8,
         workload: LoadGen.Workload,
         lgen_init: InitOptions,
         serv_init: InitOptions,
         perf_init: InitOptions,
+
+        const MeasurementOption = union(MeasurementType) {
+            profile: struct { p_args: []const u8 },
+            count: void,
+        };
     };
 
     fn init(
         self: *Measurement,
+        io: Io,
+        arena: *ArenaAllocator,
         opts: Options,
     ) Err!void {
         errdefer logErr("initializing measurement execution\n", .{}) catch {};
 
+        self.io = io;
+
         self.measurement_type = opts.measurement_type;
         self.measurement_dir = opts.measurement_dir;
-        self.p_args = opts.p_args;
 
         self.lg_handle = try LoadGenHandle.init(opts.cpu1, opts.port, opts.workload, opts.lgen_init);
 
@@ -83,6 +92,16 @@ const Measurement = struct {
             self.lg_handle.kill();
             return e;
         };
+
+        const perf_op: Perf.OpArgs = switch (opts.measurement_type) {
+            .count => .{ .trace = self.measurement_dir.traceFilename() catch return Err.Err },
+            .profile => |v| .{ .record = .{
+                .filename = self.measurement_dir.recordFilename() catch return Err.Err,
+                .p_args = v.p_args,
+            } },
+        };
+
+        self.perf = try Perf.init(io, arena, self.server_handle.pid, perf_op, opts.perf_init);
     }
 
     fn wait(self: *Measurement) Err!void {
@@ -90,69 +109,56 @@ const Measurement = struct {
 
         const lgen_result = self.lg_handle.wait();
         const serv_result = self.server_handle.close();
+        const perf_result = self.perf.wait();
 
         try lgen_result;
         try serv_result;
+        try perf_result;
     }
 
     fn kill(self: *Measurement) void {
         logErr("killing test children\n", .{}) catch {};
         self.lg_handle.kill();
         self.server_handle.close() catch {};
+        self.perf.kill();
     }
 
-    fn run(self: *Measurement, io: Io, arena: *ArenaAllocator, perf_opts: InitOptions) !void {
+    fn run(self: *Measurement) !void {
         errdefer logErr("{t} measurement failed\n", .{self.measurement_type}) catch {};
 
-        const perf_op: Perf.OpArgs = switch (self.measurement_type) {
-            .count => .{ .trace = try self.measurement_dir.traceFilename() },
-            .profile => .{ .record = .{
-                .filename = try self.measurement_dir.recordFilename(),
-                .p_args = self.p_args,
-            } },
-        };
+        var poll_fds: [3]linux.pollfd = undefined;
+        self.initPollFds(self.perf, &poll_fds);
 
-        var perf = try Perf.init(io, arena, self.server_handle.pid, perf_op, perf_opts);
+        try self.server_handle.awaitReady();
 
-        {
-            errdefer perf.kill(io);
+        try self.lg_handle.connect();
 
-            var poll_fds: [3]linux.pollfd = undefined;
-            self.initPollFds(perf, &poll_fds);
+        try self.lg_handle.awaitReady();
 
-            try self.server_handle.awaitReady();
+        self.server_handle.start(self.measurement_type);
+        try self.perf.enable();
+        try self.lg_handle.start();
 
-            try self.lg_handle.connect();
+        _ = try poll(&poll_fds);
 
-            try self.lg_handle.awaitReady();
+        try self.perf.stop();
+        try self.lg_handle.awaitDone();
+        self.server_handle.end(self.measurement_type);
 
-            self.server_handle.start(self.measurement_type);
-            try perf.enable();
-            try self.lg_handle.start();
-
-            _ = try poll(&poll_fds);
-
-            try perf.stop();
-            try self.lg_handle.awaitDone();
-            self.server_handle.end(self.measurement_type);
-
-            switch (self.measurement_type) {
-                .profile => {},
-                .count => try self.awaitReport(io),
-            }
+        switch (self.measurement_type) {
+            .profile => {},
+            .count => try self.awaitReport(),
         }
-
-        try perf.wait(io);
     }
 
-    fn awaitReport(self: *Measurement, io: Io) !void {
+    fn awaitReport(self: *Measurement) !void {
         var report: srv.Report = undefined;
         try self.server_handle.awaitResult(&report);
         const f = try self.measurement_dir.allocsFile();
         errdefer self.measurement_dir.deleteAllocsFile() catch {
             std.debug.print("cleaning up allocs file\n", .{});
         };
-        try Report.writeAllocReport(io, f, report);
+        try Report.writeAllocReport(self.io, f, report);
     }
 
     fn initPollFds(self: Measurement, perf: Perf, poll_fds: *[3]linux.pollfd) void {
@@ -180,11 +186,11 @@ const Measurement = struct {
     fn measure(io: Io, arena: *ArenaAllocator, opts: Measurement.Options) Err!void {
         var measurement: Measurement = undefined;
 
-        try measurement.init(opts);
+        try measurement.init(io, arena, opts);
 
         {
             errdefer measurement.kill();
-            measurement.run(io, arena, opts.perf_init) catch return Err.Err;
+            measurement.run() catch return Err.Err;
         }
 
         try measurement.wait();
@@ -452,6 +458,7 @@ const Perf = struct {
     child_proc: process.Child,
     ack_pipe: i32,
     ctl_pipe: i32,
+    io: Io,
 
     const PipePairs = struct {
         my_r: i32,
@@ -584,6 +591,7 @@ const Perf = struct {
             .child_proc = child,
             .ack_pipe = pipe_pairs.my_r,
             .ctl_pipe = pipe_pairs.my_w,
+            .io = io,
         };
     }
 
@@ -637,7 +645,7 @@ const Perf = struct {
         };
     }
 
-    fn wait(self: *Perf, io: Io) Err!void {
+    fn wait(self: *Perf) Err!void {
         errdefer logErr("waiting for perf pid\n", .{}) catch {};
 
         switch (errno(linux.kill(self.child_proc.id.?, linux.SIG.INT))) {
@@ -649,7 +657,7 @@ const Perf = struct {
         // process. Store the pid and signal it on error to avoid leaks.
         const child_pid = self.child_proc.id.?;
 
-        const termination = timeoutWait(io, &self.child_proc) catch |err| {
+        const termination = timeoutWait(self.io, &self.child_proc) catch |err| {
             std.debug.print("perf wait error: {t}\n", .{err});
 
             // kill with stored pid.
@@ -725,10 +733,10 @@ const Perf = struct {
         }
     }
 
-    fn kill(self: *Perf, io: Io) void {
+    fn kill(self: *Perf) void {
         lib.closeFdLog(self.ack_pipe);
         lib.closeFdLog(self.ctl_pipe);
-        self.child_proc.kill(io);
+        self.child_proc.kill(self.io);
     }
 
     fn enable(self: *Perf) Err!void {
@@ -1148,11 +1156,16 @@ pub fn runInner(
         defer measurement_dir.deinit();
 
         for (std.enums.values(MeasurementType)) |measurement_type| {
+            const mt: Measurement.Options.MeasurementOption = switch (measurement_type) {
+                .count => .count,
+                .profile => .{ .profile = .{ .p_args = cmd.p_args } },
+            };
+
             Measurement.measure(io, arena, .{
                 .cpu1 = cpu1,
                 .cpu2 = cpu2,
                 .port = cmd.port,
-                .measurement_type = measurement_type,
+                .measurement_type = mt,
                 .measurement_dir = &measurement_dir,
                 .workload = .{
                     .key_count = cmd.key_count,
@@ -1163,7 +1176,6 @@ pub fn runInner(
                 .lgen_init = opts.lgen_opts,
                 .serv_init = opts.serv_opts,
                 .perf_init = opts.perf_opts,
-                .p_args = cmd.p_args,
             }) catch |e| {
                 logErr("{t} {t} measurement failed\n", .{ op, measurement_type }) catch {};
                 break :rslt e;
@@ -1284,7 +1296,7 @@ test "perf is killed if it hangs after stop ack" {
 
     try perf.enable();
     try perf.stop();
-    try perf.wait(testing.io);
+    try perf.wait();
 }
 
 fn hangingFakePerf(t: *PerfTester) !void {
