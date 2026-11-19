@@ -25,6 +25,10 @@ In order to measure the next steps and take informed decisions, the next logical
 
 Implemented an FSM on the client to manage all the different states in which the connection can be. Before the fsm, the conditions where all over the place for retrying, errors, state of the connection. The FSM made it easy to have all the state that decides the next transition in one place.
 
+## Feistel on the load generator
+
+Permute ranges in a deterministic way by applying a small feistel network with SplitMix64 as the round function. This allows using ranges for preload, warmup, and measurements while keeping them mapped to arbitrary positions and using computed seeds to modify the order of execution. With random but deterministic order of execution, you better guarantee unbiased results due to unpredictable cache and memory access. The Feistel network also lets the load generator avoid storing keys in memory, which could skew the tests if caches are shared with the server process. All keys and values are computed on demand.
+
 ## mmap in Set-Insert
 
 The Set-Insert run showed 978 mmap and 978 munmap calls for 500k requests, which no other op had. Recording syscalls:sys_enter_mmap with call stacks put all of them under BufMap.put → BufMap.copy → SmpAllocator.alloc. They don’t come from the map resizing. They come from copying each key and value into its own allocation. 500k puts with 2 copies each is 1M allocations of 64 bytes, which works out to one mmap per about 1024 allocations: SmpAllocator mapping a new fixed-size 64 KiB slab whenever a size class runs out. Fixed slabs keep the cost of each refill constant and the waste bounded, at the price of more syscalls in total. At one mmap per ~1000 puts that cost is negligible next to the 4 syscalls per request. It goes away anyway if the parsed buffer is handed to the map instead of copied.
