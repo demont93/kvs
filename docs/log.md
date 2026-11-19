@@ -42,3 +42,30 @@ The syscall count came approximately to 2 reads, 1 poll, 1 write. This is becaus
 Conclusion for small values: Reducing syscalls is a more effective way of optimizing the server, not allocations or the hash map.
 
 Next hypothesis: With larger keys and values, cost will move toward the storage path: more allocations and more time copying in the hash map. Next step: make key and value size configurable and measure whether that cost becomes worth optimizing. After that, the next design question is concurrency in the server.
+
+## memcpy in the parser
+
+With 4 KiB values, `Parser.parse` was the hottest user-space function, at about 11% of the measured window's cycles. It copied the body with a manual byte loop, which the compiler did not vectorize. Replacing the loop with `memcpy` moved the copy into wide vector instructions.
+
+A/B on the same workload and seed, 3 runs each, with the "before" built as HEAD with the commit reverted:
+
+|        | cycles (G)       | mean |
+| ------ | ---------------- | ---- |
+| before | 6.95, 7.06, 7.02 | 7.01 |
+| after  | 6.15, 6.14, 6.22 | 6.17 |
+
+That's 0.84 G fewer cycles (−12%, about X cycles per request), against about ±1% noise between runs. The saving matches what parse used to cost (about 0.81 G), while `memcpy`'s own share grew by only about 0.04 G.
+
+## Large values: copies and fresh memory
+
+Set-Insert and Set-Replace with 256 KiB values (4000 requests, cycles:pp):
+
+- ~835k cycles per request. `memcpy` ~17%, kernel `_copy_to_iter` ~6%.
+- Page faults on fresh memory ~25% (`do_anonymous_page`, `kernel_init_pages`, memcg charge, fault entry/exit), plus `zap_present_ptes` on unmap.
+- Syscalls per request: read 66, mmap 2, munmap 2, write 1, poll 1.
+
+A value travels: socket → read buffer → parser → hash map, so three copies. Allocations above the allocator's slab sizes are mmap'd and munmap'd every time, so each request faults in and throws away ~128 pages.
+
+Decision: use the buffered read only for the frame. Once the value length is known, allocate the value buffer and read the body straight into it, then hand that buffer from the parser to the hash map. That leaves one copy (kernel → final buffer).
+
+Prediction: reads ~66 → ~2 per request, mmap/munmap 2 → 1, `memcpy` mostly gone, fault cost roughly halved (the stored value is still one fresh allocation per SET).
