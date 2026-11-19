@@ -1284,7 +1284,7 @@ test "perf is killed if it hangs after stop ack" {
 
     try perf.enable();
     try perf.stop();
-    try testing.expectError(Err.Err, perf.wait(testing.io));
+    try perf.wait(testing.io);
 }
 
 fn hangingFakePerf(t: *PerfTester) !void {
@@ -1418,12 +1418,12 @@ fn basicFakePerf(arg: usize) callconv(.c) u8 {
     var ack_w = ack_pipe.writer(testing.io, &buf_w);
     var ctl_r = ctl_pipe.reader(testing.io, &buf_r);
 
-    var buf: [6]u8 = undefined;
+    var buf: [7]u8 = undefined;
 
-    ctl_r.interface.readSliceAll(&buf) catch {
+    ctl_r.interface.readSliceAll(buf[0..6]) catch {
         return 1;
     };
-    testing.expectEqualSlices(u8, "enable", &buf) catch {
+    testing.expectEqualSlices(u8, "enable", buf[0..6]) catch {
         return 1;
     };
 
@@ -1434,10 +1434,10 @@ fn basicFakePerf(arg: usize) callconv(.c) u8 {
         return 1;
     };
 
-    ctl_r.interface.readSliceAll(buf[0..4]) catch {
+    ctl_r.interface.readSliceAll(&buf) catch {
         return 1;
     };
-    testing.expectEqualSlices(u8, "stop", buf[0..4]) catch {
+    testing.expectEqualSlices(u8, "disable", &buf) catch {
         return 1;
     };
 
@@ -1539,8 +1539,8 @@ const PerfTester = struct {
     }
 
     fn recvStop(self: *PerfTester) !void {
-        var buf: [4]u8 = undefined;
+        var buf: [7]u8 = undefined;
         try self.ctl_r.interface.readSliceAll(&buf);
-        try testing.expectEqualSlices(u8, "stop", &buf);
+        try testing.expectEqualSlices(u8, "disable", &buf);
     }
 };
