@@ -268,7 +268,7 @@ pub const encode = struct {
         val: []const u8,
         bufs: *[3][]const u8,
     ) void {
-        mem.writeInt(u32, frame[0..4], @intCast(key.len+val.len), .big);
+        mem.writeInt(u32, frame[0..4], @intCast(key.len + val.len), .big);
         mem.writeInt(u32, frame[4..8], @intCast(key.len), .big);
         frame[8] = @intFromEnum(op);
 
@@ -287,8 +287,8 @@ pub const encode = struct {
         const buf = try allocator.alloc(u8, len);
         errdefer allocator.free(buf);
 
-        mem.writeInt(u32, buf[0..4], @intCast(key.len), .big);
-        mem.writeInt(u32, buf[4..8], @intCast(val.len), .big);
+        mem.writeInt(u32, buf[0..4], @intCast(key.len + val.len), .big);
+        mem.writeInt(u32, buf[4..8], @intCast(key.len), .big);
         buf[8] = @intFromEnum(op);
         @memcpy(buf[9 .. 9 + key.len], key);
         @memcpy(buf[9 + key.len ..], val);
