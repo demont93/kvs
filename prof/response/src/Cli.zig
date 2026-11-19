@@ -289,7 +289,7 @@ fn parseScalar(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
                     val = .initFull();
                     break;
                 }
-                const v = std.meta.stringToEnum(LoadGen.Op, m) orelse return error.ExpectedValue;
+                const v = try parseEnumKebab(LoadGen.Op, arena, m);
                 val.insert(v);
             }
             return val;
@@ -297,12 +297,16 @@ fn parseScalar(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
         else => switch (@typeInfo(T)) {
             .@"enum" => {
                 const str = args.next() orelse return error.ExpectedValue;
-                const clean = try std.mem.replaceOwned(u8, arena.allocator(), str, "-", "_");
-                return std.meta.stringToEnum(T, clean) orelse error.InvalidChoice;
+                return parseEnumKebab(T, arena, str);
             },
             else => @compileError("flag type not supported"),
         },
     }
+}
+
+fn parseEnumKebab(T: type, arena: *ArenaAllocator, str: []const u8) !T {
+    const clean = try std.mem.replaceOwned(u8, arena.allocator(), str, "-", "_");
+    return std.meta.stringToEnum(T, clean) orelse error.InvalidChoice;
 }
 
 fn parseCommand(arg: []const u8) !Command(.parser) {
