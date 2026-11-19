@@ -2,7 +2,7 @@
 
 ## Zig
 
-Started the project with Rust but decided to give it a try in zig because the low level characteristics of the program require using primitives from OS. Every decision in Rust was a translation from the C API into the Rust library.
+Started the project with Rust but decided to give it a try in zig because the low level characteristics of the program require using primitives from the OS. Every decision in Rust was a translation from the C API into the Rust library.
 
 ## Naive initial implementation
 
@@ -32,3 +32,13 @@ Permute ranges in a deterministic way by applying a small feistel network with S
 ## mmap in Set-Insert
 
 The Set-Insert run showed 978 mmap and 978 munmap calls for 500k requests, which no other op had. Recording syscalls:sys_enter_mmap with call stacks put all of them under BufMap.put → BufMap.copy → SmpAllocator.alloc. They don’t come from the map resizing. They come from copying each key and value into its own allocation. 500k puts with 2 copies each is 1M allocations of 64 bytes, which works out to one mmap per about 1024 allocations: SmpAllocator mapping a new fixed-size 64 KiB slab whenever a size class runs out. Fixed slabs keep the cost of each refill constant and the waste bounded, at the price of more syscalls in total. At one mmap per ~1000 puts that cost is negligible next to the 4 syscalls per request. It goes away anyway if the parsed buffer is handed to the map instead of copied.
+
+## First profile-response runs (64 B keys/values, ping-pong, loopback)
+
+The kernel dominates. User code is around 10% of cycles (about 20k cycles per request in ReleaseFast). Most of the time goes to TCP, poll, wakeup, etc. This is what I expected. With 64-byte keys and values the server does little work per request.
+
+The syscall count came approximately to 2 reads, 1 poll, 1 write. This is because the server tries to read first and polls only on EAGAIN. With a ping-pong client the next request can't be there yet, because the client waits for the response before sending. So after every response the read returns EAGAIN, then poll, then the read that gets the frame. So should we read first or poll first for each request?  For this workload poll-first would save a read. Read-first pays off when data is often already waiting (pipelined clients) most likely. several reads. I think it is unlikely we will implement pipelined requests, and the server will most likely be waiting for the request always at the beginning. I think it doesn't really matter since it will go away on epoll.
+
+Conclusion for small values: Reducing syscalls is a more effective way of optimizing the server, not allocations or the hash map.
+
+Next hypothesis: With larger keys and values, cost will move toward the storage path: more allocations and more time copying in the hash map. Next step: make key and value size configurable and measure whether that cost becomes worth optimizing. After that, the next design question is concurrency in the server.
