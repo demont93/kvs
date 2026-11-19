@@ -616,13 +616,13 @@ test "op permute get miss" {
     const perm: OpPermute = .init(w);
 
     for (0..w.requests) |i| {
-        const p_idx = perm.warmupIdx(i);
-        const m_idx = perm.measureIdx(i);
+        const w_idx = perm.warmup_mapper.value(i);
+        const m_idx = perm.measure_mapper.value(i);
 
-        try testing.expect(p_idx >= w.key_count);
+        try testing.expect(w_idx >= w.key_count);
         try testing.expect(m_idx >= w.key_count);
 
-        if (m_idx != p_idx) all_equal = false;
+        if (m_idx != w_idx) all_equal = false;
     }
 
     try testing.expect(!all_equal);
@@ -633,10 +633,10 @@ test "op permute set insert" {
 
     const perm: OpPermute = .init(w);
     for (0..w.requests) |i| {
-        const p_idx = perm.warmupIdx(i);
-        const m_idx = perm.measureIdx(i);
+        const w_idx = perm.warmup_mapper.value(i);
+        const m_idx = perm.measure_mapper.value(i);
 
-        try testing.expect(w.key_count - w.requests <= p_idx and p_idx < w.key_count);
+        try testing.expect(w.key_count - w.requests <= w_idx and w_idx < w.key_count);
         try testing.expect(w.key_count <= m_idx and m_idx < w.key_count + w.requests);
     }
 }
@@ -647,13 +647,13 @@ test "op permute set replace" {
     var all_equal = true;
     const perm: OpPermute = .init(w);
     for (0..w.requests) |i| {
-        const p_idx = perm.warmupIdx(i);
-        const m_idx = perm.measureIdx(i);
+        const w_idx = perm.warmup_mapper.value(i);
+        const m_idx = perm.measure_mapper.value(i);
 
-        try testing.expect(p_idx < w.key_count);
+        try testing.expect(w_idx < w.key_count);
         try testing.expect(m_idx < w.key_count);
 
-        if (m_idx != p_idx) all_equal = false;
+        if (m_idx != w_idx) all_equal = false;
     }
 
     try testing.expect(!all_equal);
@@ -667,8 +667,8 @@ test "op permute delete hit" {
     try testing.expectEqual(w.key_count + w.requests, perm.preloadRange());
 
     for (0..w.requests) |i| {
-        const p_idx = perm.warmupIdx(i);
-        const m_idx = perm.measureIdx(i);
+        const p_idx = perm.warmup_mapper.value(i);
+        const m_idx = perm.measure_mapper.value(i);
 
         try testing.expect(p_idx >= w.key_count);
         try testing.expect(m_idx < w.key_count);
