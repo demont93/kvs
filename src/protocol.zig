@@ -107,7 +107,6 @@ pub const Parser = struct {
         chunk: []const u8,
         req: *Request,
     ) ParseError!bool {
-        var chunk_index: usize = 0;
         // At this point the frame is already parsed and cant return an invalid op.
         const bl, const kl, const op = self.get_frame() catch unreachable;
 
@@ -116,15 +115,10 @@ pub const Parser = struct {
         }
         var req_buf = &req.buf.?;
 
-        var body_index = self.body_index;
-        const min = @min(chunk.len, req_buf.len - body_index);
+        @memcpy(req_buf.ptr + self.body_index, chunk);
 
-        for (0..min) |_| {
-            req_buf.*[body_index] = chunk[chunk_index];
-            chunk_index += 1;
-            body_index += 1;
-        }
-        self.body_index = body_index;
+        self.body_index += @intCast(chunk.len);
+
         if (self.body_index != req_buf.len) {
             return false;
         }
@@ -138,17 +132,8 @@ pub const Parser = struct {
     }
 
     fn parse_frame(self: *Parser, chunk: []const u8) ParseError!void {
-        var chunk_index: usize = 0;
-        var frame_index = self.frame_index;
-
-        const min = @min(chunk.len, self.frame_buf.len - frame_index);
-
-        for (0..min) |_| {
-            self.frame_buf[frame_index] = chunk[chunk_index];
-            frame_index += 1;
-            chunk_index += 1;
-        }
-        self.frame_index = frame_index;
+        @memcpy(self.frame_buf[self.frame_index..].ptr, chunk);
+        self.frame_index += @intCast(chunk.len);
 
         if (self.frame_index < self.frame_buf.len) {
             return;
