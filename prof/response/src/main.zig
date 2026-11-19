@@ -18,7 +18,7 @@ pub fn main(init: std.process.Init) !void {
                 .cpu1 = cli_args.cpu1,
                 .cpu2 = cli_args.cpu2,
                 .key_count = cli_args.@"key-count",
-                .ops = .initOne(cli_args.op),
+                .ops = cli_args.ops,
                 .port = cli_args.port,
                 .requests = cli_args.requests,
                 .seed = cli_args.seed,
@@ -34,4 +34,5 @@ test {
     _ = @import("Cli.zig");
     _ = @import("srv.zig");
     _ = @import("LoadGen.zig");
+    std.testing.refAllDecls(@This());
 }

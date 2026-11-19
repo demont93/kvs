@@ -5,6 +5,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const Args = std.process.Args;
 const mem = std.mem;
 const testing = std.testing;
+const EnumSet = std.enums.EnumSet;
 
 const Self = @This();
 
@@ -21,11 +22,15 @@ const CommandSpec = union(enum) {
         pub const requests: FieldSpec(u64) = .{ .short = 'r' };
         pub const @"key-count": FieldSpec(u64) = .{ .short = 'k' };
         pub const seed: FieldSpec(u64) = .{ .short = 's' };
-        pub const op: FieldSpec(LoadGen.Op) = .{ .short = 'o' };
+        pub const ops: FieldSpec(std.enums.EnumSet(LoadGen.Op)) = .{ .short = 'o' };
 
         fn validate(cmd: anytype) !void {
             if (cmd.cpu1 == cmd.cpu2) {
                 return error.SameCpu;
+            }
+            if (cmd.requests > cmd.@"key-count") {
+                // TODO: Remove this. Implement requests wrapping over keys.
+                return error.MoreRequestsThanKeys;
             }
         }
     },
@@ -275,6 +280,20 @@ fn parseScalar(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
             const val = args.next() orelse return error.ExpectedValue;
             return try arena.allocator().dupe(u8, val);
         },
+        EnumSet(LoadGen.Op) => {
+            const comma_delimited = args.next() orelse return error.ExpectedValue;
+            var it = mem.splitScalar(u8, comma_delimited, ',');
+            var val: EnumSet(LoadGen.Op) = .initEmpty();
+            while (it.next()) |m| {
+                if (mem.eql(u8, "all", m)) {
+                    val = .initFull();
+                    break;
+                }
+                const v = std.meta.stringToEnum(LoadGen.Op, m) orelse return error.ExpectedValue;
+                val.insert(v);
+            }
+            return val;
+        },
         else => switch (@typeInfo(T)) {
             .@"enum" => {
                 const str = args.next() orelse return error.ExpectedValue;
@@ -314,8 +333,9 @@ fn printHelp(self: *Self) void {
         \\        -k, --key-count Amount of keys to preload kvs with
         \\        -s, --seed      Seed for the prng
         \\        -r, --requests  Amount of requests to send
-        \\        -o, --op        Operation: get-hit, get-miss, set-insert,
-        \\                          set-replace, delete-hit, delete-miss
+        \\        -o, --op        Comma delimited list of Operations: get-hit, get-miss,
+        \\                          set-insert, set-replace, delete-hit, delete-miss.
+        \\                          "all" is a special case that marks all.
         \\
     ,
         .{},
@@ -386,5 +406,5 @@ test "parse full command" {
     try testing.expectEqual(234, out.run.@"key-count");
     try testing.expectEqual(234234, out.run.seed);
     try testing.expectEqual(1, out.run.requests);
-    try testing.expectEqual(LoadGen.Op.get_hit, out.run.op);
+    try testing.expectEqual(EnumSet(LoadGen.Op).initOne(.get_hit), out.run.ops);
 }
