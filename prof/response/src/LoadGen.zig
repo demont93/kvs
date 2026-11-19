@@ -14,8 +14,8 @@ const heap = std.heap;
 
 const Self = @This();
 
-const key_size: usize = 64;
-const value_size: usize = 64;
+// const key_size: usize = 64;
+// const value_size: usize = 64;
 
 r_buf: [1]u8 = undefined,
 gpa: Allocator,
@@ -23,10 +23,11 @@ arena: std.heap.ArenaAllocator,
 threaded: Io.Threaded,
 workload: Workload,
 mapper: OpPermute,
-gen: EntryGenerator(key_size, value_size),
-out_key: [key_size]u8 = undefined,
-out_value: [value_size]u8 = undefined,
-inc_value: [value_size]u8 = undefined,
+gen: EntryGenerator,
+buf: []u8,
+out_key: []u8,
+out_value: []u8,
+inc_value: []u8,
 client: kvs.Client,
 sock: i32,
 
@@ -245,32 +246,35 @@ const Feistel = struct {
     }
 };
 
-fn EntryGenerator(k_size: usize, v_size: usize) type {
-    return struct {
-        prng: Random.Xoshiro256,
-        seed: u64,
+// fn EntryGenerator(k_size: usize, v_size: usize) type {
+const EntryGenerator = struct {
+    prng: Random.Xoshiro256,
+    seed: u64,
+    key_size: usize,
+    value_size: usize,
 
-        fn init(seed: u64) @This() {
-            assert(k_size > @sizeOf(u64));
-            var sm = Random.SplitMix64.init(seed);
-            return .{
-                .prng = Random.Xoshiro256.init(seed),
-                .seed = sm.next(),
-            };
-        }
+    fn init(seed: u64, key_size: usize, value_size: usize) @This() {
+        assert(key_size > @sizeOf(u64));
+        var sm = Random.SplitMix64.init(seed);
+        return .{
+            .prng = Random.Xoshiro256.init(seed),
+            .seed = sm.next(),
+            .key_size = key_size,
+            .value_size = value_size,
+        };
+    }
 
-        fn entry(self: *@This(), index: usize, key: []u8, value: []u8) void {
-            assert(key.len == k_size);
-            assert(value.len == v_size);
+    fn entry(self: *@This(), index: usize, key: []u8, value: []u8) void {
+        assert(key.len == self.key_size);
+        assert(value.len == self.value_size);
 
-            self.prng.seed(self.seed +% index);
+        self.prng.seed(self.seed +% index);
 
-            std.mem.writeInt(usize, key[0..@sizeOf(u64)], @intCast(index), .native);
-            self.prng.random().bytes(key[@sizeOf(u64)..]);
-            self.prng.random().bytes(value);
-        }
-    };
-}
+        std.mem.writeInt(usize, key[0..@sizeOf(u64)], @intCast(index), .native);
+        self.prng.random().bytes(key[@sizeOf(u64)..]);
+        self.prng.random().bytes(value);
+    }
+};
 
 pub const Context = struct {
     workload: Workload,
@@ -283,6 +287,8 @@ pub const Workload = struct {
     operation: Op,
     requests: usize,
     key_count: usize,
+    key_size: usize = 64,
+    value_size: usize = 64,
     seed: u64,
 };
 
@@ -353,13 +359,26 @@ fn init(self: *Self, workload: Workload, addr: []const u8, socket: i32) !void {
     self.threaded = .init(self.gpa, .{});
     self.workload = workload;
     try self.client.init(self.io(), addr, .{ .idle_timeout = .fromSeconds(60), .max_attempts = 1 });
-    self.gen = .init(workload.seed);
+    self.gen = .init(workload.seed, workload.key_size, workload.value_size);
     self.sock = socket;
     self.mapper = .init(workload);
+    self.buf = try self.gpa.alloc(u8, workload.key_size + workload.value_size * 2);
+    {
+        var start: usize = 0;
+
+        self.out_key = self.buf[start .. start + workload.key_size];
+        start += self.out_key.len;
+
+        self.out_value = self.buf[start .. start + workload.value_size];
+        start += self.out_value.len;
+
+        self.inc_value = self.buf[start .. start + workload.value_size];
+    }
 }
 
 fn deinit(self: *Self) void {
     self.arena.deinit();
+    self.gpa.free(self.buf);
 }
 
 fn run(self: *Self) !void {
@@ -392,13 +411,13 @@ fn run(self: *Self) !void {
 }
 
 fn getHit(self: *Self, mapFn: OpPermute.MapFn) !void {
-    var alloc: heap.FixedBufferAllocator = .init(&self.inc_value);
+    var alloc: heap.FixedBufferAllocator = .init(self.inc_value);
 
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
-        self.gen.entry(idx, &self.out_key, &self.out_value);
+        self.gen.entry(idx, self.out_key, self.out_value);
 
-        var r = try self.client.get(alloc.allocator(), &self.out_key);
+        var r = try self.client.get(alloc.allocator(), self.out_key);
         defer r.deinit(alloc.allocator());
 
         if (r.code != .Ok) {
@@ -406,10 +425,10 @@ fn getHit(self: *Self, mapFn: OpPermute.MapFn) !void {
             return error.Err;
         }
 
-        if (!mem.eql(u8, r.value, &self.out_value)) {
+        if (!mem.eql(u8, r.value, self.out_value)) {
             std.debug.print(
                 "got unexpected value: {s}, expected: {s}\n",
-                .{ r.value, &self.out_value },
+                .{ r.value, self.out_value },
             );
             return error.Err;
         }
@@ -417,13 +436,13 @@ fn getHit(self: *Self, mapFn: OpPermute.MapFn) !void {
 }
 
 fn getMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
-    var alloc: heap.FixedBufferAllocator = .init(&self.inc_value);
+    var alloc: heap.FixedBufferAllocator = .init(self.inc_value);
 
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
-        self.gen.entry(idx, &self.out_key, &self.out_value);
+        self.gen.entry(idx, self.out_key, self.out_value);
 
-        var r = try self.client.get(alloc.allocator(), &self.out_key);
+        var r = try self.client.get(alloc.allocator(), self.out_key);
         defer r.deinit(alloc.allocator());
 
         if (r.code != .NotFound) {
@@ -436,9 +455,9 @@ fn getMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
 fn setInsert(self: *Self, mapFn: OpPermute.MapFn) !void {
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
-        self.gen.entry(idx, &self.out_key, &self.out_value);
+        self.gen.entry(idx, self.out_key, self.out_value);
 
-        var r = try self.client.set(&self.out_key, &self.out_value);
+        var r = try self.client.set(self.out_key, self.out_value);
 
         if (r.code != .Ok) {
             std.debug.print("got {t} while doing warmup\n", .{r.code});
@@ -450,9 +469,9 @@ fn setInsert(self: *Self, mapFn: OpPermute.MapFn) !void {
 fn setReplace(self: *Self, mapFn: OpPermute.MapFn) !void {
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
-        self.gen.entry(idx, &self.out_key, &self.out_value);
+        self.gen.entry(idx, self.out_key, self.out_value);
 
-        var r = try self.client.set(&self.out_key, &self.out_value);
+        var r = try self.client.set(self.out_key, self.out_value);
 
         if (r.code != .Ok) {
             std.debug.print("got {t} while doing warmup\n", .{r.code});
@@ -464,9 +483,9 @@ fn setReplace(self: *Self, mapFn: OpPermute.MapFn) !void {
 fn deleteHit(self: *Self, mapFn: OpPermute.MapFn) !void {
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
-        self.gen.entry(idx, &self.out_key, &self.out_value);
+        self.gen.entry(idx, self.out_key, self.out_value);
 
-        var r = try self.client.del(&self.out_key);
+        var r = try self.client.del(self.out_key);
 
         if (r.code != .Ok) {
             std.debug.print("got {t} while doing warmup\n", .{r.code});
@@ -478,9 +497,9 @@ fn deleteHit(self: *Self, mapFn: OpPermute.MapFn) !void {
 fn deleteMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
     for (0..self.workload.requests) |i| {
         const idx = mapFn(self.mapper, i);
-        self.gen.entry(idx, &self.out_key, &self.out_value);
+        self.gen.entry(idx, self.out_key, self.out_value);
 
-        var r = try self.client.del(&self.out_key);
+        var r = try self.client.del(self.out_key);
 
         if (r.code != .NotFound) {
             std.debug.print("got {t} while doing warmup\n", .{r.code});
@@ -490,13 +509,13 @@ fn deleteMiss(self: *Self, mapFn: OpPermute.MapFn) !void {
 }
 
 fn preload(self: *Self) !void {
-    assert(key_size >= @sizeOf(u64));
+    assert(self.workload.key_size >= @sizeOf(u64));
     const range = self.mapper.preloadRange();
 
     for (0..range) |i| {
         const idx = self.mapper.preloadIdx(i);
-        self.gen.entry(idx, &self.out_key, &self.out_value);
-        const r = try self.client.set(&self.out_key, &self.out_value);
+        self.gen.entry(idx, self.out_key, self.out_value);
+        const r = try self.client.set(self.out_key, self.out_value);
         if (r.code != .Ok) {
             std.debug.print("got error response from server: {t}\n", .{r.code});
             return error.Err;
@@ -528,7 +547,7 @@ test {
 test "entry generator is deterministic" {
     const elem_size: usize = 64;
     const entries: usize = 50;
-    var gen: EntryGenerator(elem_size, elem_size) = .init(0);
+    var gen: EntryGenerator = .init(0, elem_size, elem_size);
 
     var buf: [elem_size * 2 * entries]u8 = undefined;
 
@@ -587,7 +606,12 @@ test "feistel maps to correct output" {
 }
 
 test "op permute get hit" {
-    var w: Workload = .{ .key_count = 100, .operation = .get_hit, .requests = 20, .seed = 0 };
+    var w: Workload = .{
+        .key_count = 100,
+        .operation = .get_hit,
+        .requests = 20,
+        .seed = 0,
+    };
 
     var measure_and_warmup_equal = true;
     var measure_and_preload_equal = true;

@@ -21,6 +21,8 @@ const CommandSpec = union(enum) {
         pub const cpu2: FieldSpec(i32) = .{ .short = '2' };
         pub const requests: FieldSpec(u64) = .{ .short = 'r' };
         pub const @"key-count": FieldSpec(u64) = .{ .short = 'k' };
+        pub const @"key-size": FieldSpec(usize) = .{ .default = 64 };
+        pub const @"value-size": FieldSpec(usize) = .{ .default = 64 };
         pub const seed: FieldSpec(u64) = .{ .short = 's' };
         pub const ops: FieldSpec(std.enums.EnumSet(LoadGen.Op)) = .{ .short = 'o' };
         pub const @"p-args": FieldSpec(?[]u8) = .{};
@@ -273,7 +275,7 @@ fn parseValue(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
 fn parseScalar(T: type, arena: *ArenaAllocator, args: *Args.Iterator) !T {
     switch (T) {
         bool => return true,
-        u16, i16, i32, u64 => |U| {
+        u16, i16, i32, u64, usize => |U| {
             const val = args.next() orelse return error.ExpectedValue;
             return try std.fmt.parseInt(U, val, 10);
         },
@@ -341,6 +343,9 @@ fn printHelp(self: *Self) void {
         \\        -o, --op        Comma delimited list of Operations: get-hit, get-miss,
         \\                          set-insert, set-replace, delete-hit, delete-miss.
         \\                          "all" is a special case that marks all.
+        \\        --key-size      Size of the key. Default 64 bytes
+        \\        --value-size    Size of the value. Default 64 bytes
+        \\        --p-args        Arguments to forward to perf record
         \\
     ,
         .{},

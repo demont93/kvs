@@ -22,6 +22,8 @@ const srv = @import("srv.zig");
 pub const Run = struct {
     requests: usize,
     key_count: usize,
+    key_size: usize,
+    value_size: usize,
     seed: usize,
     cpu1: i32,
     cpu2: i32,
@@ -1059,6 +1061,8 @@ const Report = struct {
             \\workload.ops={s}
             \\workload.requests={}
             \\workload.key_count={}
+            \\workload.key_size={}
+            \\workload.value_size={}
             \\workload.seed={}
             \\
         ,
@@ -1082,6 +1086,8 @@ const Report = struct {
                 ops,
                 meta.run_args.requests,
                 meta.run_args.key_count,
+                meta.run_args.key_size,
+                meta.run_args.value_size,
                 meta.run_args.seed,
             },
         );
@@ -1171,6 +1177,8 @@ pub fn runInner(
                     .key_count = cmd.key_count,
                     .operation = op,
                     .requests = cmd.requests,
+                    .key_size = cmd.key_size,
+                    .value_size = cmd.value_size,
                     .seed = cmd.seed,
                 },
                 .lgen_init = opts.lgen_opts,
@@ -1270,6 +1278,8 @@ test "setCpuset" {
 
 test "happy path" {
     const run_cmd: Run = .{
+        .key_size = 64,
+        .value_size = 64,
         .port = 9999,
         .cpu1 = 1,
         .cpu2 = 2,

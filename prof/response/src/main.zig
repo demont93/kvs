@@ -23,6 +23,8 @@ pub fn main(init: std.process.Init) !void {
                 .requests = cli_args.requests,
                 .seed = cli_args.seed,
                 .p_args = cli_args.@"p-args" orelse &.{},
+                .value_size = cli_args.@"value-size",
+                .key_size = cli_args.@"key-size",
             };
 
             try runner.run(init.io, init.gpa, init.arena, parsed);
