@@ -84,7 +84,7 @@ pub const Listener = struct {
             switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => {},
                 .BADF => |e| syscall.errno_bug("close", e),
-                else => |e| log_err("closing connection", e),
+                else => |e| logErr("closing connection", e),
             }
             self.sock_fd = -1;
             return;
@@ -190,7 +190,7 @@ pub const Listener = struct {
                 .AGAIN,
                 => |e| syscall.errno_bug("accept", e),
                 else => |e| {
-                    log_err("unexpected accept error", e);
+                    logErr("unexpected accept error", e);
                     continue;
                 },
             };
@@ -206,7 +206,7 @@ pub const Listener = struct {
             switch (linux.errno(close_rc)) {
                 .SUCCESS, .INTR => {},
                 .BADF => |e| syscall.errno_bug("close", e),
-                else => |e| log_err("closing listener", e),
+                else => |e| logErr("closing listener", e),
             }
         }
     }
@@ -216,7 +216,7 @@ pub const Listener = struct {
         InvalidAddr,
     };
 
-    pub fn local_addr(self: Listener, addr: *linux.sockaddr, len: *u32) AddrError!void {
+    pub fn localAddr(self: Listener, addr: *linux.sockaddr, len: *u32) AddrError!void {
         const rc = linux.getsockname(self.sock_fd, addr, len);
         switch (linux.errno(rc)) {
             .SUCCESS => {},
@@ -238,7 +238,7 @@ const BufReader = struct {
         return self.buf;
     }
 
-    inline fn mark_written(self: *BufReader, size: usize) void {
+    inline fn markWritten(self: *BufReader, size: usize) void {
         self.end = size;
     }
 
@@ -344,7 +344,7 @@ pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{O
     self.retry_state = .{};
 
     // Allocate buffers from one block.
-    const mem_size = alloc_size(opts.read_buf_size, opts.max_drain);
+    const mem_size = allocSize(opts.read_buf_size, opts.max_drain);
     self.mem_buf = try allocator.alignedAlloc(
         u8,
         .fromByteUnits(std.atomic.cache_line),
@@ -362,7 +362,7 @@ pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{O
 
     self.map = BufMap.init(allocator);
 
-    install_sig_handler();
+    installSigHandler();
 }
 
 pub fn serve(self: *Self) void {
@@ -387,7 +387,7 @@ pub fn serve(self: *Self) void {
             continue;
         };
 
-        const result = self.handle_connection(&conn, &diag);
+        const result = self.handleConnection(&conn, &diag);
         conn.close();
         result catch |e| {
             switch (e) {
@@ -405,7 +405,7 @@ pub fn serve(self: *Self) void {
     }
 }
 
-pub fn listen_and_serve(
+pub fn listenAndServe(
     self: *Self,
     addr: []const u8,
 ) void {
@@ -415,12 +415,12 @@ pub fn listen_and_serve(
     };
 
     var localaddr: linux.sockaddr.in = undefined;
-    self.local_addr(&localaddr) catch |e| {
+    self.localAddr(&localaddr) catch |e| {
         debug.print("failed to get local address: {s}\n", .{@errorName(e)});
         return;
     };
 
-    const addr_str = format_addr(localaddr);
+    const addr_str = formatAddr(localaddr);
     debug.print("Listening and serving on {s}\n", .{std.mem.span(addr_str[0..].ptr)});
 
     self.serve();
@@ -430,13 +430,13 @@ pub fn bind(self: *Self, addr: []const u8) Listener.BindError!void {
     return self.listener.bind(addr);
 }
 
-fn listen_and_serve_one(
+fn listenAndServeOne(
     self: *Self,
     diag: *ConnectionDiagnostics,
 ) (RequestError || Listener.AcceptError)!void {
     var conn = try self.listener.accept();
     defer conn.close();
-    try self.handle_connection(&conn, diag);
+    try self.handleConnection(&conn, diag);
 }
 
 pub fn close(self: *Self) void {
@@ -447,14 +447,14 @@ pub fn close(self: *Self) void {
 
 /// Assumes that the process is single threaded. If the server gets more threads, the signal may
 /// land in any thread. While the variable will be set, the poll or connect may not get INTR'd.
-fn install_sig_handler() void {
+fn installSigHandler() void {
     var mask = linux.sigemptyset();
     linux.sigaddset(&mask, .TERM);
     linux.sigaddset(&mask, .INT);
 
     const act: linux.Sigaction = .{
         .flags = 0,
-        .handler = .{ .handler = &sig_handler },
+        .handler = .{ .handler = &sigHandler },
         .mask = mask,
     };
     switch (linux.errno(linux.sigaction(.INT, &act, null))) {
@@ -467,7 +467,7 @@ fn install_sig_handler() void {
     }
 }
 
-fn sig_handler(signal: linux.SIG) callconv(.c) void {
+fn sigHandler(signal: linux.SIG) callconv(.c) void {
     _ = signal;
     stop.store(true, .monotonic);
 }
@@ -482,7 +482,7 @@ const RequestError = error{
     Stop,
 };
 
-fn handle_connection(
+fn handleConnection(
     self: *Self,
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
@@ -490,7 +490,7 @@ fn handle_connection(
     var result: RequestResult = .Continue;
     defer self.read_buf.reset();
     while (result == .Continue) {
-        result = try self.handle_request(conn, diag);
+        result = try self.handleRequest(conn, diag);
     }
 }
 
@@ -499,7 +499,7 @@ const RequestResult = enum {
     Continue,
 };
 
-fn handle_request(
+fn handleRequest(
     self: *Self,
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
@@ -511,14 +511,14 @@ fn handle_request(
         }
     }
 
-    const read_result = self.read_request(conn, diag, &req) catch |err| {
+    const read_result = self.readRequest(conn, diag, &req) catch |err| {
         const error_response = switch (err) {
             error.ConnectionReset, error.Unexpected, error.Stop => |e| return e,
             error.OutOfMemory => encode.internal,
             error.BadRequest => encode.invalid,
             error.ReadTimeout => encode.timeout,
         };
-        self.write_drain(conn, error_response);
+        self.writeDrain(conn, error_response);
         return @errorCast(err);
     };
 
@@ -528,14 +528,14 @@ fn handle_request(
     }
 
     const response, const free = self.handler(&req, diag) catch |e| {
-        self.write_drain(conn, protocol.encode.internal);
+        self.writeDrain(conn, protocol.encode.internal);
         return e;
     };
     defer {
         if (free) self.allocator.free(response);
     }
 
-    self.write_all(conn, response) catch |err| {
+    self.writeAll(conn, response) catch |err| {
         diag.record(.Write, err);
         return @errorCast(err);
     };
@@ -589,7 +589,7 @@ const ReadRequestError = error{
     Stop,
 };
 
-fn read_request(
+fn readRequest(
     self: *Self,
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
@@ -600,7 +600,7 @@ fn read_request(
     // First Read
     var done, const deadline = first_read: {
         const idle_deadline = self.make_deadline(self.idle_timeout);
-        var chunk = self.read_buffered(
+        var chunk = self.readBuffered(
             conn,
             self.parser.bytes_required(),
             idle_deadline,
@@ -618,7 +618,7 @@ fn read_request(
         const deadline = self.make_deadline(self.read_timeout);
 
         const done = self.parser.parse(self.allocator, chunk, req) catch |e|
-            return handle_parse_err(e, diag);
+            return handleParseErr(e, diag);
 
         break :first_read .{ done, deadline };
     };
@@ -626,7 +626,7 @@ fn read_request(
     // Subsequent reads
     while (!done) {
         const needed = self.parser.bytes_required();
-        const chunk = self.read_buffered(conn, needed, deadline) catch |e| {
+        const chunk = self.readBuffered(conn, needed, deadline) catch |e| {
             diag.record(.SubsequentReads, e);
             return e;
         };
@@ -635,7 +635,7 @@ fn read_request(
             return error.BadRequest;
         }
         done = self.parser.parse(self.allocator, chunk, req) catch |e|
-            return handle_parse_err(e, diag);
+            return handleParseErr(e, diag);
     }
 
     return .Continue;
@@ -646,7 +646,7 @@ const ParseError = error{
     BadRequest,
 };
 
-fn handle_parse_err(err: protocol.ParseError, diag: *ConnectionDiagnostics) ParseError {
+fn handleParseErr(err: protocol.ParseError, diag: *ConnectionDiagnostics) ParseError {
     const e = switch (err) {
         error.InvalidRequest, error.UnexpectedBytes, error.EmptyRequest => error.BadRequest,
         error.OutOfMemory => |e| e,
@@ -664,7 +664,7 @@ const ReadError = error{
     Stop,
 };
 
-fn read_buffered(
+fn readBuffered(
     self: *Self,
     conn: *Listener.Connection,
     size: usize,
@@ -705,7 +705,7 @@ fn read_buffered(
                 else => |e| return e,
             };
         }
-        self.read_buf.mark_written(n);
+        self.read_buf.markWritten(n);
         chunk = self.read_buf.contents(size);
     }
     return chunk;
@@ -724,8 +724,8 @@ const WriteError = error{
 };
 
 /// Shuts down the write side of the connection. Caller must close after calling this.
-fn write_drain(self: *Self, conn: *Listener.Connection, buf: []const u8) void {
-    self.write_all(conn, buf) catch return;
+fn writeDrain(self: *Self, conn: *Listener.Connection, buf: []const u8) void {
+    self.writeAll(conn, buf) catch return;
     conn.shutdown();
     self.drain(conn);
 }
@@ -752,16 +752,16 @@ fn drain(self: *Self, conn: *Listener.Connection) void {
     }
 }
 
-fn write_all(
+fn writeAll(
     self: *Self,
     conn: *Listener.Connection,
     buf: []const u8,
 ) WriteError!void {
     const deadline = self.make_deadline(self.write_timeout);
-    try self.write_all_poll(conn, buf, deadline);
+    try self.writeAllPoll(conn, buf, deadline);
 }
 
-fn write_all_poll(
+fn writeAllPoll(
     self: *Self,
     conn: *Listener.Connection,
     buf: []const u8,
@@ -780,12 +780,12 @@ fn write_all_poll(
     };
 }
 
-fn local_addr(self: Self, addr: *linux.sockaddr.in) Listener.AddrError!void {
+fn localAddr(self: Self, addr: *linux.sockaddr.in) Listener.AddrError!void {
     var len: u32 = @sizeOf(@TypeOf(addr));
-    try self.listener.local_addr(@ptrCast(addr), &len);
+    try self.listener.localAddr(@ptrCast(addr), &len);
 }
 
-fn format_addr(localaddr: linux.sockaddr.in) [22:0]u8 {
+fn formatAddr(localaddr: linux.sockaddr.in) [22:0]u8 {
     var addr_buf: [22:0]u8 = undefined;
     const bytes: *const [4]u8 = @ptrCast(&localaddr.addr);
     const printed = std.fmt.bufPrint(&addr_buf, "{}.{}.{}.{}:{}", .{
@@ -799,7 +799,8 @@ fn format_addr(localaddr: linux.sockaddr.in) [22:0]u8 {
     return addr_buf;
 }
 
-fn alloc_size(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, split: usize } {
+/// Determines the alloc size for a read buffer and a drain buffer, rounded up to cache line size.
+fn allocSize(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, split: usize } {
     const cache_line = std.atomic.cache_line;
     const mask: usize = cache_line - 1;
     const read_buf: usize = if (req_read_buf & mask > 0)
@@ -810,7 +811,7 @@ fn alloc_size(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, s
 }
 
 /// Expects a non-negative duration. Fails if duration is too long.
-fn to_timeval(duration: Io.Duration) ?linux.timeval {
+fn toTimeval(duration: Io.Duration) ?linux.timeval {
     assert(duration.nanoseconds >= 0);
     const us: i64 = @intCast(@divTrunc(@rem(duration.nanoseconds, 1_000_000_000), 1000));
     const s = math.cast(isize, duration.toSeconds()) orelse return null;
@@ -832,7 +833,7 @@ fn log(comptime fmt: []const u8, args: anytype) void {
     debug.print(fmt, args);
 }
 
-fn log_err(msg: []const u8, e: anytype) void {
+fn logErr(msg: []const u8, e: anytype) void {
     debug.print("{s}: {t}\n", .{ msg, e });
 }
 
@@ -1058,7 +1059,7 @@ const Tester = struct {
         );
 
         var addr: linux.sockaddr.in = undefined;
-        try self.server.local_addr(&addr);
+        try self.server.localAddr(&addr);
         const ip4 = net.IpAddress{ .ip4 = net.Ip4Address{
             .bytes = @bitCast(addr.addr),
             .port = @byteSwap(addr.port),
@@ -1148,7 +1149,7 @@ const Tester = struct {
         );
 
         var addr: linux.sockaddr.in = undefined;
-        try self.server.local_addr(&addr);
+        try self.server.localAddr(&addr);
         const ip4 = net.IpAddress{ .ip4 = net.Ip4Address{
             .bytes = @bitCast(addr.addr),
             .port = @byteSwap(addr.port),
@@ -1167,6 +1168,6 @@ const Tester = struct {
     }
 
     fn server_thread(server: *Self, result: *anyerror!void, diag: *ConnectionDiagnostics) void {
-        result.* = server.listen_and_serve_one(diag);
+        result.* = server.listenAndServeOne(diag);
     }
 };

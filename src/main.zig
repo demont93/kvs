@@ -16,5 +16,5 @@ pub fn main(init: std.process.Init) !void {
 
     var server: kvs.Server = undefined;
     try server.init(init.gpa, init.io, .{});
-    server.listen_and_serve(args[1]);
+    server.listenAndServe(args[1]);
 }
