@@ -9,16 +9,18 @@ const Thread = std.Thread;
 const net = Io.net;
 const Allocator = std.mem.Allocator;
 const ArenaAllocator = std.heap.ArenaAllocator;
-const builtin = @import("builtin");
 const assert = debug.assert;
-const Clock = Io.Clock.awake;
+const Clock = Io.Clock;
+const Duration = Io.Duration;
 const BufMap = std.BufMap;
-const encode = protocol.encode;
-const syscall = @import("syscall.zig");
 const iovec = std.posix.iovec;
 const ArrayList = std.ArrayList;
+const builtin = @import("builtin");
 
 const protocol = @import("protocol.zig");
+const response = protocol.response;
+const request = protocol.request;
+const syscall = @import("syscall.zig");
 
 const Self = @This();
 
@@ -31,10 +33,10 @@ listener: Listener,
 mem_buf: []align(std.atomic.cache_line) u8,
 request_bufs: RequestBuffers,
 drain_buf: []u8,
-read_timeout: Io.Duration,
-write_timeout: Io.Duration,
-idle_timeout: Io.Duration,
-grace_period: Io.Duration,
+read_timeout: Duration,
+write_timeout: Duration,
+idle_timeout: Duration,
+grace_period: Duration,
 allocator: Allocator,
 retry_state: RetryState,
 unexpected_errno: linux.E,
@@ -66,7 +68,7 @@ pub const Listener = struct {
                     .INVAL,
                     .NOTCONN,
                     => |e| syscall.errnoBug("read", e),
-                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
+                    else => |e| return syscall.recordUnexpectedErrno(unexpected, e),
                 }
             }
         }
@@ -85,7 +87,7 @@ pub const Listener = struct {
                     .INVAL,
                     .NOTCONN,
                     => |e| syscall.errnoBug("read", e),
-                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
+                    else => |e| return syscall.recordUnexpectedErrno(unexpected, e),
                 }
             }
         }
@@ -104,7 +106,7 @@ pub const Listener = struct {
                     .INVAL,
                     .NOTCONN,
                     => |e| syscall.errnoBug("write", e),
-                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
+                    else => |e| return syscall.recordUnexpectedErrno(unexpected, e),
                 }
             };
         }
@@ -274,7 +276,7 @@ const Request = struct {
 };
 
 const RequestBuffers = struct {
-    frame_buffer: [protocol.frame_size]u8 = undefined,
+    frame_buffer: [request.frame_size]u8 = undefined,
     frame: ArrayList(u8),
 
     tail: TailBuffer,
@@ -293,7 +295,7 @@ const RequestBuffers = struct {
     err_reason: ?Diagnostics,
 
     const Diagnostics = union(enum) {
-        parse: protocol.Request.InvalidFrame,
+        parse: request.InvalidFrame,
         oom,
     };
 
@@ -417,7 +419,7 @@ const RequestBuffers = struct {
         assert(self.stage == .kv);
 
         const req: Request = .{
-            .op = protocol.Request.frameOp(self.frame_buffer),
+            .op = request.frameOp(self.frame_buffer),
             .key = self.key_buf.?,
             .value = self.value_buf,
         };
@@ -496,20 +498,20 @@ const RequestBuffers = struct {
     fn transitionKvStage(self: *RequestBuffers, allocator: Allocator) bool {
         self.stage = .kv;
 
-        var reason: protocol.Request.InvalidFrame = undefined;
-        if (!protocol.Request.validateFrame(self.frame_buffer, &reason)) {
+        var reason: request.InvalidFrame = undefined;
+        if (!request.validateFrame(self.frame_buffer, &reason)) {
             self.err_reason = .{ .parse = reason };
             return false;
         }
 
-        const kl = protocol.Request.frameKeyLen(self.frame_buffer);
+        const kl = request.frameKeyLen(self.frame_buffer);
         self.key_buf = allocator.alloc(u8, kl) catch {
             self.err_reason = .oom;
             return false;
         };
         self.key = .initBuffer(self.key_buf.?);
 
-        const vl = protocol.Request.frameValueLen(self.frame_buffer);
+        const vl = request.frameValueLen(self.frame_buffer);
         if (vl > 0) {
             self.value_buf = allocator.alloc(u8, vl) catch {
                 self.err_reason = .oom;
@@ -566,7 +568,7 @@ const RequestBuffers = struct {
         try testing.expect(rb.done());
         var diag: Diagnostics = undefined;
         try testing.expectEqual(null, rb.claimRequest(testing.allocator, &diag));
-        try testing.expectEqual(protocol.Request.InvalidFrame.malformed, diag.parse);
+        try testing.expectEqual(request.InvalidFrame.malformed, diag.parse);
 
         rb.reset(testing.allocator);
         const region2 = rb.writeRegion();
@@ -585,8 +587,8 @@ const RequestBuffers = struct {
 
         try testing.expect(!rb.done());
 
-        const msg = try protocol.encode.encode_client_msg_alloc(.get, "hello", "", arena.allocator());
-        const msg2 = try protocol.encode.encode_client_msg_alloc(.get, "hola", "", arena.allocator());
+        const msg = try request.encodeAlloc(.get, "hello", "", arena.allocator());
+        const msg2 = try request.encodeAlloc(.get, "hola", "", arena.allocator());
         const merged = try std.mem.concat(arena.allocator(), u8, &.{ msg, msg2 });
 
         const region = rb.writeRegion();
@@ -620,10 +622,10 @@ const RequestBuffers = struct {
 };
 
 pub const ServerOpts = struct {
-    read_timeout: Io.Duration = .fromSeconds(6),
-    write_timeout: Io.Duration = .fromSeconds(6),
-    idle_timeout: Io.Duration = .fromSeconds(10),
-    grace_period: Io.Duration = .fromSeconds(2),
+    read_timeout: Duration = .fromSeconds(6),
+    write_timeout: Duration = .fromSeconds(6),
+    idle_timeout: Duration = .fromSeconds(10),
+    grace_period: Duration = .fromSeconds(2),
     read_buf_size: usize = 1024 * 4,
     max_drain: usize = 1024 * 4,
 };
@@ -668,7 +670,7 @@ const RetryState = struct {
 
     fn wait(self: *RetryState, io: Io) void {
         debug.print("backing off for {}ms\n", .{self.backoff});
-        io.sleep(.fromMilliseconds(self.backoff), Clock) catch debug.panic("can't sleep", .{});
+        io.sleep(.fromMilliseconds(self.backoff), .awake) catch debug.panic("can't sleep", .{});
         if (self.backoff < max_backoff) self.backoff *= 2;
     }
 
@@ -848,27 +850,27 @@ fn handleRequest(
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
 ) RequestError!RequestResult {
-    const request = self.readRequest(conn, diag) catch |err| {
+    const req = self.readRequest(conn, diag) catch |err| {
         const error_response = switch (err) {
             error.Finished => return .done,
             error.ConnectionReset, error.Unexpected, error.Stop => |e| return e,
-            error.OutOfMemory => encode.internal,
-            error.BadRequest => encode.invalid,
-            error.ReadTimeout, error.IdleTimeout => encode.timeout,
+            error.OutOfMemory => response.internal,
+            error.BadRequest => response.invalid,
+            error.ReadTimeout, error.IdleTimeout => response.timeout,
         };
         self.writeDrain(conn, error_response);
         return err;
     };
 
-    const response, const free = self.handler(request, diag) catch |e| {
-        self.writeDrain(conn, protocol.encode.internal);
+    const resp, const free = self.handler(req, diag) catch |e| {
+        self.writeDrain(conn, response.internal);
         return e;
     };
     defer {
-        if (free) self.allocator.free(response);
+        if (free) self.allocator.free(resp);
     }
 
-    self.writeAll(conn, response) catch |err| {
+    self.writeAll(conn, resp) catch |err| {
         diag.record(.write, err);
         return @errorCast(err);
     };
@@ -886,13 +888,13 @@ fn handler(
             defer self.allocator.free(req.key);
 
             if (self.map.get(req.key)) |v| {
-                const msg = encode.value(self.allocator, v) catch |err| {
+                const msg = response.value(self.allocator, v) catch |err| {
                     diag.record(.encode, err);
                     return err;
                 };
                 return .{ msg, true };
             } else {
-                return .{ encode.not_found, false };
+                return .{ response.not_found, false };
             }
         },
         .del => {
@@ -901,14 +903,14 @@ fn handler(
             if (self.map.hash_map.fetchRemove(req.key)) |kv| {
                 self.map.hash_map.allocator.free(kv.key);
                 self.map.hash_map.allocator.free(kv.value);
-                return .{ encode.ok, false };
+                return .{ response.ok, false };
             } else {
-                return .{ encode.not_found, false };
+                return .{ response.not_found, false };
             }
         },
         .set => {
             if (self.map.putMove(req.key, req.value.?)) |_| {
-                return .{ encode.ok, false };
+                return .{ response.ok, false };
             } else |e| {
                 self.allocator.free(req.key);
                 self.allocator.free(req.value.?);
@@ -940,7 +942,7 @@ fn readRequest(
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
 ) ReadRequestError!Request {
-    const idle_deadline = self.make_deadline(self.idle_timeout);
+    const idle_deadline = self.makeDeadline(self.idle_timeout);
     var fds: [1]linux.pollfd = .{syscall.pollfd(conn.sock_fd, linux.POLL.IN)};
 
     if (!self.request_bufs.done()) {
@@ -960,7 +962,7 @@ fn readRequest(
         self.request_bufs.commit(self.allocator, n_read);
     }
 
-    const read_deadline = self.make_deadline(self.read_timeout);
+    const read_deadline = self.makeDeadline(self.read_timeout);
 
     while (!self.request_bufs.done()) {
         const n_read = self.readConnection(conn, &fds, read_deadline, .non_stoppable) catch |err| {
@@ -1004,7 +1006,7 @@ fn readConnection(
     self: *Self,
     conn: *Listener.Connection,
     fds: *[1]linux.pollfd,
-    deadline: Io.Clock.Timestamp,
+    deadline: Clock.Timestamp,
     stoppable: Stoppable,
 ) ReadConnectionError!usize {
     return while (true) {
@@ -1033,7 +1035,7 @@ fn readConnection(
     };
 }
 
-fn timeout_remaining_ms(self: Self, deadline: Io.Clock.Timestamp) ?i32 {
+fn timeout_remaining_ms(self: Self, deadline: Clock.Timestamp) ?i32 {
     const timeout = deadline.durationFromNow(self.io).raw.toMilliseconds();
     return if (timeout > 0) @intCast(timeout) else null;
 }
@@ -1053,7 +1055,7 @@ fn writeDrain(self: *Self, conn: *Listener.Connection, buf: []const u8) void {
 }
 
 fn drain(self: *Self, conn: *Listener.Connection) void {
-    const deadline = self.make_deadline(self.grace_period);
+    const deadline = self.makeDeadline(self.grace_period);
     var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
     var i: usize = 0;
     while (i < self.drain_buf.len) {
@@ -1064,7 +1066,7 @@ fn drain(self: *Self, conn: *Listener.Connection) void {
             &self.unexpected_errno,
         ) catch |e| switch (e) {
             error.Timeout, error.Unexpected => return,
-            error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+            error.TooManyPollFds => syscall.zerrnoBug("poll", e),
             error.OutOfMemory => log("OutOfMemory when draining request\n", .{}),
         };
 
@@ -1079,7 +1081,7 @@ fn writeAll(
     conn: *Listener.Connection,
     buf: []const u8,
 ) WriteError!void {
-    const deadline = self.make_deadline(self.write_timeout);
+    const deadline = self.makeDeadline(self.write_timeout);
     try self.writeAllPoll(conn, buf, deadline);
 }
 
@@ -1087,9 +1089,9 @@ fn writeAllPoll(
     self: *Self,
     conn: *Listener.Connection,
     buf: []const u8,
-    deadline: Io.Clock.Timestamp,
+    deadline: Clock.Timestamp,
 ) WriteError!void {
-    syscall.send_all_poll(
+    syscall.sendAllPoll(
         conn.sock_fd,
         buf,
         deadline,
@@ -1098,7 +1100,7 @@ fn writeAllPoll(
     ) catch |e| switch (e) {
         error.Timeout => return error.WriteTimeout,
         error.ConnectionReset, error.OutOfMemory, error.Unexpected => |e| return e,
-        else => |e| syscall.zerrno_bug("send | poll", e),
+        else => |e| syscall.zerrnoBug("send | poll", e),
     };
 }
 
@@ -1133,22 +1135,22 @@ fn allocSize(req_read_buf: usize, req_drain_buf: usize) struct { size: usize, sp
 }
 
 /// Expects a non-negative duration. Fails if duration is too long.
-fn toTimeval(duration: Io.Duration) ?linux.timeval {
+fn toTimeval(duration: Duration) ?linux.timeval {
     assert(duration.nanoseconds >= 0);
     const us: i64 = @intCast(@divTrunc(@rem(duration.nanoseconds, 1_000_000_000), 1000));
     const s = math.cast(isize, duration.toSeconds()) orelse return null;
     return .{ .sec = s, .usec = us };
 }
 
-fn make_deadline(self: Self, duration: Io.Duration) Io.Clock.Timestamp {
-    return Io.Clock.Timestamp.fromNow(
+fn makeDeadline(self: Self, duration: Duration) Clock.Timestamp {
+    return Clock.Timestamp.fromNow(
         self.io,
-        Io.Clock.Duration{ .raw = duration, .clock = Clock },
+        Io.Clock.Duration{ .raw = duration, .clock = .awake },
     );
 }
 
-fn now(self: Self) Io.Clock.Timestamp {
-    return Io.Clock.Timestamp.now(self.io, Clock);
+fn now(self: Self) Clock.Timestamp {
+    return Clock.Timestamp.now(self.io, Clock);
 }
 
 fn log(comptime fmt: []const u8, args: anytype) void {
@@ -1176,7 +1178,7 @@ test "bind to a connection and read happy" {
 
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(protocol.ResponseCode.NotFound), 0, 0, 0, 0 },
+        &[_]u8{ @intFromEnum(response.Code.NotFound), 0, 0, 0, 0 },
         &response_buf,
     );
 
@@ -1193,13 +1195,13 @@ test "slow writing client gets read timeout" {
     const n_written = try w.interface.write(&[_]u8{0});
     try testing.expectEqual(1, n_written);
     try w.interface.flush();
-    var response: [5]u8 = undefined;
+    var resp: [5]u8 = undefined;
     var r = t.client_reader();
-    try r.interface.readSliceAll(&response);
+    try r.interface.readSliceAll(&resp);
     try testing.expectEqualSlices(
         u8,
-        &[_]u8{ @intFromEnum(protocol.ResponseCode.Timeout), 0, 0, 0, 0 },
-        &response,
+        &[_]u8{ @intFromEnum(response.Code.Timeout), 0, 0, 0, 0 },
+        &resp,
     );
     try testing.expectError(error.ReadTimeout, t.close());
     try testing.expectEqual(Action.subsequent_reads, t.diag.action);
@@ -1217,9 +1219,9 @@ test "slow reading client gets write timeout" {
         &[_]u8{ 0, 0, 0, 3, 0, 0, 0, 3, 0, 'a', 'l', 'e' },
     );
     try w.interface.flush();
-    var response: [20]u8 = undefined;
+    var resp: [20]u8 = undefined;
     var r = t.client_reader();
-    try r.interface.readSliceAll(&response);
+    try r.interface.readSliceAll(&resp);
     try testing.io.sleep(.fromMilliseconds(400), .awake);
     try testing.expectError(error.WriteTimeout, t.close());
     try testing.expectEqual(Action.write, t.diag.action);
@@ -1272,7 +1274,7 @@ test "many requests on the same connection" {
     try w.interface.writeAll(&set);
     try w.interface.flush();
     try r.interface.readSliceAll(&resp1);
-    try testing.expectEqualSlices(u8, protocol.encode.ok, &resp1);
+    try testing.expectEqualSlices(u8, response.ok, &resp1);
 
     var resp2: [8]u8 = undefined;
     try w.interface.writeAll(&get);
@@ -1284,13 +1286,13 @@ test "many requests on the same connection" {
     try w.interface.writeAll(&del);
     try w.interface.flush();
     try r.interface.readSliceAll(&resp3);
-    try testing.expectEqualSlices(u8, protocol.encode.ok, &resp3);
+    try testing.expectEqualSlices(u8, response.ok, &resp3);
 
     var resp4: [5]u8 = undefined;
     try w.interface.writeAll(&get);
     try w.interface.flush();
     try r.interface.readSliceAll(&resp4);
-    try testing.expectEqualSlices(u8, protocol.encode.not_found, &resp4);
+    try testing.expectEqualSlices(u8, response.not_found, &resp4);
 
     try t.close();
 }
@@ -1305,14 +1307,14 @@ test "idle connection timeout" {
     try w.interface.writeAll(&[_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 1 });
     try w.interface.flush();
     try r.interface.readSliceAll(&buf);
-    try testing.expectEqualSlices(u8, protocol.encode.not_found, &buf);
+    try testing.expectEqualSlices(u8, response.not_found, &buf);
 
     try testing.io.sleep(.fromMilliseconds(180), .awake);
 
     try w.interface.writeAll(&[_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 1 });
     try w.interface.flush();
     try r.interface.readSliceAll(&buf);
-    try testing.expectEqualSlices(u8, protocol.encode.not_found, &buf);
+    try testing.expectEqualSlices(u8, response.not_found, &buf);
 
     try testing.io.sleep(.fromMilliseconds(300), .awake);
 
@@ -1339,7 +1341,7 @@ test "data doesn't leak into next connection" {
 
     var buf: [5]u8 = undefined;
     try r.interface.readSliceAll(&buf);
-    try testing.expectEqualSlices(u8, protocol.encode.ok, &buf);
+    try testing.expectEqualSlices(u8, response.ok, &buf);
     const result = t.close_connection();
     errdefer debug.print("\n{any}\n", .{result});
 
@@ -1351,7 +1353,7 @@ test "data doesn't leak into next connection" {
     try w.interface.writeAll(&[_]u8{ 0, 0, 0, 1, 0, 0, 0, 1, 0, 1 });
     try w.interface.flush();
     try r.interface.readSliceAll(&buf);
-    try testing.expectEqualSlices(u8, protocol.encode.not_found, &buf);
+    try testing.expectEqualSlices(u8, response.not_found, &buf);
 
     try t.close();
 }
@@ -1413,7 +1415,7 @@ const Tester = struct {
     } || Io.Reader.Error || Io.Writer.Error;
 
     fn write_request(self: *Tester, bytes: []const u8, response_buf: []u8) !void {
-        const timeout = Io.Duration.fromSeconds(1);
+        const timeout = Duration.fromSeconds(1);
 
         var wbuf: [512]u8 = undefined;
         var w = self.client.writer(self.io, &wbuf);
@@ -1428,7 +1430,7 @@ const Tester = struct {
         self: Tester,
         comptime func: anytype,
         args: std.meta.ArgsTuple(@TypeOf(func)),
-        timeout: Io.Duration,
+        timeout: Duration,
     ) error{Timeout}!ReturnType(func) {
         const T: type = ReturnType(func);
         const Result = union(enum) {
@@ -1439,7 +1441,7 @@ const Tester = struct {
         var sel: Io.Select(Result) = .init(self.io, &results);
         defer sel.cancelDiscard();
         sel.concurrent(.io, func, args) catch @panic("");
-        sel.concurrent(.timeout, Io.sleep, .{ sel.io, timeout, Clock }) catch @panic("");
+        sel.concurrent(.timeout, Io.sleep, .{ sel.io, timeout, .awake }) catch @panic("");
         return switch (sel.await() catch @panic("")) {
             .io => |res| res,
             .timeout => error.Timeout,

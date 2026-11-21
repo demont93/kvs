@@ -13,11 +13,11 @@ pub fn errnoBug(syscall_name: []const u8, e: linux.E) noreturn {
     debug.panic("bug: unexpected error on {s} call: {t}\n", .{ syscall_name, e });
 }
 
-pub fn zerrno_bug(syscall_name: []const u8, e: anyerror) noreturn {
+pub fn zerrnoBug(syscall_name: []const u8, e: anyerror) noreturn {
     debug.panic("bug: unexpected error on {s} call: {t}\n", .{ syscall_name, e });
 }
 
-pub fn record_unexpected_errno(unexpected: ?*linux.E, e: linux.E) error{Unexpected} {
+pub fn recordUnexpectedErrno(unexpected: ?*linux.E, e: linux.E) error{Unexpected} {
     if (unexpected) |u| {
         u.* = e;
     }
@@ -122,14 +122,14 @@ pub fn pollintr(
     deadline: Clock.Timestamp,
     unexpected: ?*linux.E,
 ) (error{Intr} || PollError)!usize {
-    const timeout = timeout_remaining_ms(io, deadline) orelse return error.Timeout;
+    const timeout = timeoutRemainingMs(io, deadline) orelse return error.Timeout;
     const poll_rc = linux.poll(fds.ptr, fds.len, timeout);
     return switch (linux.errno(poll_rc)) {
         .SUCCESS => if (poll_rc == 0) error.Timeout else poll_rc,
         .INTR => error.Intr,
         .INVAL => error.TooManyPollFds,
         .FAULT => |e| errnoBug("poll", e),
-        else => |e| record_unexpected_errno(unexpected, e),
+        else => |e| recordUnexpectedErrno(unexpected, e),
     };
 }
 
@@ -137,7 +137,7 @@ pub fn pollfd(fd: i32, events: i16) linux.pollfd {
     return .{ .events = events, .fd = fd, .revents = 0 };
 }
 
-fn timeout_remaining_ms(io: Io, deadline: Clock.Timestamp) ?i32 {
+fn timeoutRemainingMs(io: Io, deadline: Clock.Timestamp) ?i32 {
     const timeout = deadline.durationFromNow(io).raw.toMilliseconds();
     return if (timeout > 0) @intCast(timeout) else null;
 }
@@ -152,7 +152,7 @@ pub const RecvAllError = error{
     OutOfMemory,
 };
 
-pub fn recv_all(
+pub fn recvAll(
     fd: i32,
     buf: []u8,
     deadline: Clock.Timestamp,
@@ -217,7 +217,7 @@ pub fn recv(fd: i32, buf: []u8, unexpected: ?*linux.E) RecvError!usize {
             .CONNRESET => error.ConnectionReset,
             .NOMEM => error.OutOfMemory,
             .FAULT, .NOTCONN, .NOTSOCK => |e| errnoBug("read", e),
-            else => |e| record_unexpected_errno(unexpected, e),
+            else => |e| recordUnexpectedErrno(unexpected, e),
         };
     }
 }
@@ -226,7 +226,7 @@ pub const SendAllError = error{Timeout} || SendError;
 
 /// Send a messages through a connection oriented socket writing and waiting no longer than deadline
 /// when it would block.
-pub fn send_all_poll(
+pub fn sendAllPoll(
     fd: i32,
     buf: []const u8,
     deadline: Io.Clock.Timestamp,
@@ -235,7 +235,7 @@ pub fn send_all_poll(
 ) SendAllError!void {
     var i: usize = 0;
 
-    i += try send_retry(fd, buf, unexpected);
+    i += try sendRetry(fd, buf, unexpected);
     if (i == buf.len) {
         return;
     }
@@ -245,10 +245,10 @@ pub fn send_all_poll(
     while (i < buf.len) {
         _ = poll(io, @as(*[1]linux.pollfd, &pfd), deadline, unexpected) catch |e| switch (e) {
             error.OutOfMemory, error.Timeout, error.Unexpected => |e| return e,
-            else => |e| zerrno_bug("poll", e),
+            else => |e| zerrnoBug("poll", e),
         };
 
-        i += try send_retry(fd, buf[i..], unexpected);
+        i += try sendRetry(fd, buf[i..], unexpected);
     }
 }
 
@@ -263,7 +263,7 @@ pub const SendError = error{
 };
 
 /// Send to a socket while performing inner retry on EINTR.
-pub fn send_retry(fd: i32, buf: []const u8, unexpected: ?*linux.E) !usize {
+pub fn sendRetry(fd: i32, buf: []const u8, unexpected: ?*linux.E) !usize {
     while (true) {
         const write_rc = linux.write(fd, buf.ptr, buf.len);
         return switch (errno(write_rc)) {
@@ -282,7 +282,7 @@ pub fn send_retry(fd: i32, buf: []const u8, unexpected: ?*linux.E) !usize {
             .MSGSIZE,
             .OPNOTSUPP,
             => |e| errnoBug("write", e),
-            else => |e| record_unexpected_errno(unexpected, e),
+            else => |e| recordUnexpectedErrno(unexpected, e),
         };
     }
 }
@@ -307,10 +307,10 @@ test "octet parser" {
 }
 
 test "fuzz the address parse function" {
-    try testing.fuzz({}, fuzz_addr_parse_function, .{});
+    try testing.fuzz({}, fuzzAddrParseFn, .{});
 }
 
-fn fuzz_addr_parse_function(context: void, smith: *testing.Smith) !void {
+fn fuzzAddrParseFn(context: void, smith: *testing.Smith) !void {
     _ = context;
     var addr_buf: [40]u8 = undefined;
 

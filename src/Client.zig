@@ -19,12 +19,13 @@ const Reader = Io.Reader;
 const Random = std.Random;
 
 const protocol = @import("protocol.zig");
+const request = protocol.request;
+const response = protocol.response;
+pub const max_key_size = protocol.max_key_size;
+pub const max_value_size = protocol.max_value_size;
 const syscall = @import("syscall.zig");
 
 const Self = @This();
-
-pub const max_key_size = protocol.max_key_size;
-pub const max_value_size = protocol.max_value_size;
 
 const retry_connect_delay: Duration = .fromMilliseconds(100);
 const retry_connect_delay_cap: Duration = .fromMilliseconds(500);
@@ -116,7 +117,7 @@ const Request = struct {
         random: Random,
     ) error{ Canceled, Timeout }!void {
         self.backoff_attempts += 1;
-        try protocol.exponential_backoff_with_jitter(
+        try protocol.exponentialBackoffWithJitter(
             io,
             random,
             self.backoff_attempts,
@@ -128,7 +129,7 @@ const Request = struct {
 };
 
 pub const Response = struct {
-    code: protocol.ResponseCode = .Internal,
+    code: response.Code = .Internal,
     value: []u8 = &.{},
 
     pub fn deinit(self: *Response, allocator: Allocator) void {
@@ -161,35 +162,35 @@ pub fn init(
     self.max_attempts = opts.max_attempts;
 }
 
-pub const GetError = protocol.encode.KeyError || RequestError;
+pub const GetError = response.KeyError || RequestError;
 
 pub fn get(self: *Self, allocator: Allocator, key: []const u8) GetError!Response {
-    try protocol.encode.check_key(key);
+    try response.checkKey(key);
     var frame: [9]u8 = undefined;
     var bufs: [3][]const u8 = undefined;
-    protocol.encode.encode_client_msg(.get, &frame, key, &.{}, &bufs);
-    return self.do_request(allocator, .get, &bufs);
+    request.encode(.get, &frame, key, &.{}, &bufs);
+    return self.doRequest(allocator, .get, &bufs);
 }
 
-pub const SetError = protocol.encode.KeyError || protocol.encode.ValueError || RequestError;
+pub const SetError = response.KeyError || response.ValueError || RequestError;
 
 pub fn set(self: *Self, key: []const u8, value: []const u8) SetError!Response {
-    try protocol.encode.check_key(key);
-    try protocol.encode.check_value(value);
+    try response.checkKey(key);
+    try response.checkValue(value);
     var frame: [9]u8 = undefined;
     var bufs: [3][]const u8 = undefined;
-    protocol.encode.encode_client_msg(.set, &frame, key, value, &bufs);
-    return self.do_request(null, .set, &bufs);
+    request.encode(.set, &frame, key, value, &bufs);
+    return self.doRequest(null, .set, &bufs);
 }
 
-pub const DelError = protocol.encode.KeyError || RequestError;
+pub const DelError = response.KeyError || RequestError;
 
 pub fn del(self: *Self, key: []const u8) DelError!Response {
-    try protocol.encode.check_key(key);
+    try response.checkKey(key);
     var frame: [9]u8 = undefined;
     var bufs: [3][]const u8 = undefined;
-    protocol.encode.encode_client_msg(.del, &frame, key, &.{}, &bufs);
-    return self.do_request(null, .del, &bufs);
+    request.encode(.del, &frame, key, &.{}, &bufs);
+    return self.doRequest(null, .del, &bufs);
 }
 
 const RequestError = error{
@@ -203,17 +204,17 @@ const RequestError = error{
     Canceled,
 };
 
-fn do_request(
+fn doRequest(
     self: *Self,
     allocator: ?Allocator,
     op: protocol.Op,
     data: *[3][]const u8,
 ) RequestError!Response {
-    const deadline = self.create_deadline(self.timeout);
+    const deadline = self.createDeadline(self.timeout);
     var req: Request = .init(op, self.max_attempts, deadline);
 
-    if (self.sock_fd >= 0 and self.idle_connection_is_expired()) {
-        self.close_fd();
+    if (self.sock_fd >= 0 and self.idleConnectionIsExpired()) {
+        self.closeFd();
     }
 
     const result = while (req.next()) {
@@ -238,7 +239,7 @@ fn do_request(
             continue;
         };
 
-        self.writev_all(data, &req) catch |err| {
+        self.writevAll(data, &req) catch |err| {
             const state: ConnState = switch (err) {
                 error.Timeout => .timeout,
                 error.ConnectionError => .error_before_write,
@@ -248,7 +249,7 @@ fn do_request(
             continue;
         };
 
-        break self.do_request_read_response(allocator, &req) catch |err| {
+        break self.doRequestReadResponse(allocator, &req) catch |err| {
             const state: ConnState = switch (err) {
                 error.Unexpected => .fatal,
                 error.ConnectionError => .error_after_write,
@@ -262,7 +263,7 @@ fn do_request(
         self.last_request = self.now();
     } else |_| {
         if (self.sock_fd >= 0) {
-            self.close_fd();
+            self.closeFd();
         }
     }
 
@@ -299,20 +300,20 @@ fn connect(self: *Self, req: *Request) ConnectError!void {
 
     self.sock_fd = @intCast(socket_rc);
 
-    errdefer self.close_fd();
+    errdefer self.closeFd();
 
     const connect_rc = linux.connect(self.sock_fd, &self.addr, @sizeOf(@TypeOf(self.addr)));
     switch (errno(connect_rc)) {
         .SUCCESS => return,
         // For a nonblocking socket, EINTR is the same as EINPROGRESS.
         .INTR, .INPROGRESS, .AGAIN => {},
-        else => |e| return handle_connect_errno(req, e),
+        else => |e| return handleConnectErrno(req, e),
     }
 
     var unexpected: linux.E = undefined;
     var pollfds = [_]linux.pollfd{syscall.pollfd(self.sock_fd, linux.POLL.OUT)};
     _ = syscall.poll(self.io, &pollfds, req.deadline, &unexpected) catch |e| switch (e) {
-        error.TooManyPollFds => syscall.zerrno_bug("poll", e),
+        error.TooManyPollFds => syscall.zerrnoBug("poll", e),
         error.Unexpected => {
             req.log_err(unexpected);
             return error.Unexpected;
@@ -343,11 +344,11 @@ fn connect(self: *Self, req: *Request) ConnectError!void {
     const sock_err: linux.E = @enumFromInt(raw_sock_err);
     switch (sock_err) {
         .SUCCESS => {},
-        else => |e| return handle_connect_errno(req, e),
+        else => |e| return handleConnectErrno(req, e),
     }
 }
 
-fn handle_connect_errno(req: *Request, err: linux.E) ConnectError {
+fn handleConnectErrno(req: *Request, err: linux.E) ConnectError {
     switch (err) {
         // Handled by caller
         .INTR, .AGAIN, .INPROGRESS => unreachable,
@@ -385,7 +386,7 @@ const WriteError = error{
     Unexpected,
 };
 
-fn writev_all(self: *Self, data: *[3][]const u8, req: *Request) WriteError!void {
+fn writevAll(self: *Self, data: *[3][]const u8, req: *Request) WriteError!void {
     var fds = syscall.pollfd(self.sock_fd, linux.POLL.OUT);
     var iovec_arr: [3]posix.iovec_const = undefined;
     const iovecs = blk: {
@@ -453,7 +454,7 @@ fn writev_all(self: *Self, data: *[3][]const u8, req: *Request) WriteError!void 
             req.deadline,
             &unexpected,
         ) catch |err| switch (err) {
-            error.TooManyPollFds => |e| syscall.zerrno_bug("poll", e),
+            error.TooManyPollFds => |e| syscall.zerrnoBug("poll", e),
             error.Unexpected => {
                 req.log_err(unexpected);
                 return error.Unexpected;
@@ -474,50 +475,50 @@ const ReadResponseError = error{
     Unexpected,
 };
 
-fn do_request_read_response(
+fn doRequestReadResponse(
     self: *Self,
     allocator: ?Allocator,
     req: *Request,
 ) ReadResponseError!Response {
     var frame: [5]u8 = undefined;
 
-    try self.do_request_read_response_recv_all(req, &frame);
+    try self.doRequestReadResponseRecvAll(req, &frame);
 
-    var response: Response = .{};
-    errdefer if (allocator) |a| response.deinit(a);
+    var resp: Response = .{};
+    errdefer if (allocator) |a| resp.deinit(a);
 
-    if (std.enums.fromInt(protocol.ResponseCode, frame[0])) |res| {
-        response.code = res;
+    if (std.enums.fromInt(response.Code, frame[0])) |res| {
+        resp.code = res;
     } else {
-        return bad_response(req);
+        return badResponse(req);
     }
 
     const len = std.mem.readInt(u32, frame[1..], .big);
 
     if (len > 0 and req.op != .get) {
-        return bad_response(req);
+        return badResponse(req);
     }
 
     if (len > protocol.max_value_size) {
-        return bad_response(req);
+        return badResponse(req);
     }
 
     if (len > 0) {
-        response.value = allocator.?.alloc(u8, len) catch return error.ConnectionError;
-        try self.do_request_read_response_recv_all(req, response.value);
+        resp.value = allocator.?.alloc(u8, len) catch return error.ConnectionError;
+        try self.doRequestReadResponseRecvAll(req, resp.value);
     }
 
-    return response;
+    return resp;
 }
 
-fn bad_response(req: *Request) error{ConnectionError} {
+fn badResponse(req: *Request) error{ConnectionError} {
     req.log_err(error.BadResponse);
     return error.ConnectionError;
 }
 
-fn do_request_read_response_recv_all(self: Self, req: *Request, buf: []u8) !void {
+fn doRequestReadResponseRecvAll(self: Self, req: *Request, buf: []u8) !void {
     var unexpected: linux.E = undefined;
-    syscall.recv_all(
+    syscall.recvAll(
         self.sock_fd,
         buf,
         req.deadline,
@@ -525,7 +526,7 @@ fn do_request_read_response_recv_all(self: Self, req: *Request, buf: []u8) !void
         null,
         &unexpected,
     ) catch |err| switch (err) {
-        error.Badf => syscall.zerrno_bug("read", err),
+        error.Badf => syscall.zerrnoBug("read", err),
         error.Unexpected => {
             req.log_err(unexpected);
             return error.Unexpected;
@@ -542,15 +543,15 @@ pub fn deinit(self: *Self) void {
         return;
     }
 
-    self.close_fd();
+    self.closeFd();
 }
 
 fn reconnect(self: *Self, req: *Request) ConnectError!void {
-    self.close_fd();
+    self.closeFd();
     try self.connect(req);
 }
 
-fn close_fd(self: *Self) void {
+fn closeFd(self: *Self) void {
     const close_rc = linux.close(self.sock_fd);
     switch (errno(close_rc)) {
         .SUCCESS => {},
@@ -560,7 +561,7 @@ fn close_fd(self: *Self) void {
     self.sock_fd = -1;
 }
 
-fn create_deadline(self: Self, duration: Duration) Clock.Timestamp {
+fn createDeadline(self: Self, duration: Duration) Clock.Timestamp {
     return self.now().addDuration(.{ .clock = .awake, .raw = duration });
 }
 
@@ -568,7 +569,7 @@ fn now(self: Self) Clock.Timestamp {
     return .now(self.io, .awake);
 }
 
-fn idle_connection_is_expired(self: Self) bool {
+fn idleConnectionIsExpired(self: Self) bool {
     return self.last_request
         .addDuration(.{ .clock = .awake, .raw = self.idle_timeout })
         .compare(.lt, self.now());
@@ -590,10 +591,10 @@ const TestServer = struct {
             expected_code: protocol.Op,
             expected_key: []const u8,
             expected_value: []const u8,
-            response_code: protocol.ResponseCode,
+            response_code: response.Code,
             response_value: []const u8,
         ) !void {
-            return expect_request(
+            return expectRequest(
                 arena,
                 &self.r.interface,
                 &self.w.interface,
@@ -780,17 +781,17 @@ fn server(
     stream.close(testing.io);
 }
 
-fn expect_request(
+fn expectRequest(
     arena: Allocator,
     r: *Reader,
     w: *Writer,
     expected_code: protocol.Op,
     expected_key: []const u8,
     expected_value: []const u8,
-    response_code: protocol.ResponseCode,
+    response_code: response.Code,
     response_value: []const u8,
 ) !void {
-    const exp = try protocol.encode.encode_client_msg_alloc(
+    const exp = try request.encodeAlloc(
         expected_code,
         expected_key,
         expected_value,
@@ -799,44 +800,44 @@ fn expect_request(
     const req: []u8 = try arena.alloc(u8, exp.len);
     try r.readSliceAll(req);
     try testing.expectEqualSlices(u8, exp, req);
-    const resp = try protocol.encode.encode_srv_msg(arena, response_code, response_value);
+    const resp = try response.encode(arena, response_code, response_value);
     try w.writeAll(resp);
     try w.flush();
 }
 
 test "send request receive response" {
-    var t = try Tester.init_connection(send_request_receive_response_server);
+    var t = try Tester.init_connection(sendRequestReceiveResponseServer);
     defer t.deinit();
     const addr = try t.str_addr();
     try t.client.init(testing.io, addr, .{});
     defer t.client.deinit();
     var resp = try t.client.set("hola", "chao");
     defer resp.deinit(testing.allocator);
-    try testing.expectEqual(protocol.ResponseCode.Ok, resp.code);
+    try testing.expectEqual(response.Code.Ok, resp.code);
     try testing.expectEqual(0, resp.value.len);
     try t.join();
 }
 
-fn send_request_receive_response_server(srv: *TestServer, t: *TestShared) !void {
+fn sendRequestReceiveResponseServer(srv: *TestServer, t: *TestShared) !void {
     var s = try srv.accept();
     try s.expect_req(t.arena(), .set, "hola", "chao", .Ok, &.{});
     s.close();
 }
 
 test "multiple requests" {
-    var t = try Tester.init_connection(multiple_requests_server);
+    var t = try Tester.init_connection(multipleRequestsServer);
     defer t.deinit();
     const addr = try t.str_addr();
     try t.client.init(testing.io, addr, .{});
     defer t.client.deinit();
     var resp1 = try t.client.del("something else gigantic");
-    try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
+    try testing.expectEqual(response.Code.Ok, resp1.code);
     var resp2 = try t.client.get(t.arena(), "0");
-    try testing.expectEqual(protocol.ResponseCode.NotFound, resp2.code);
+    try testing.expectEqual(response.Code.NotFound, resp2.code);
     try t.join();
 }
 
-fn multiple_requests_server(srv: *TestServer, t: *TestShared) !void {
+fn multipleRequestsServer(srv: *TestServer, t: *TestShared) !void {
     var s = try srv.accept();
     try s.expect_req(t.arena(), .del, "something else gigantic", &.{}, .Ok, &.{});
     try s.expect_req(t.arena(), .get, "0", &.{}, .NotFound, &.{});
@@ -844,14 +845,14 @@ fn multiple_requests_server(srv: *TestServer, t: *TestShared) !void {
 }
 
 test "client reconnects on stale connection" {
-    var t = try Tester.init_connection(client_reconnects_on_stale_connection_server);
+    var t = try Tester.init_connection(clientReconnectOnStaleConnectionServer);
     defer t.deinit();
     const addr = try t.str_addr();
     try t.client.init(testing.io, addr, .{});
     defer t.client.deinit();
 
     var resp1 = try t.client.set("something", &.{});
-    try testing.expectEqual(protocol.ResponseCode.Ok, resp1.code);
+    try testing.expectEqual(response.Code.Ok, resp1.code);
 
     try t.t.event.waitTimeout(
         testing.io,
@@ -859,12 +860,12 @@ test "client reconnects on stale connection" {
     );
 
     var resp2 = try t.client.get(t.arena(), "0");
-    try testing.expectEqual(protocol.ResponseCode.NotFound, resp2.code);
+    try testing.expectEqual(response.Code.NotFound, resp2.code);
 
     try t.join();
 }
 
-fn client_reconnects_on_stale_connection_server(srv: *TestServer, t: *TestShared) !void {
+fn clientReconnectOnStaleConnectionServer(srv: *TestServer, t: *TestShared) !void {
     var s = try srv.accept();
     try s.expect_req(t.arena(), .set, "something", &.{}, .Ok, "");
 
@@ -900,7 +901,7 @@ test "reattempts connect" {
 
     ev.set(testing.io);
     const r = try c.del("s");
-    try testing.expectEqual(protocol.ResponseCode.Ok, r.code);
+    try testing.expectEqual(response.Code.Ok, r.code);
 
     try h.await(testing.io);
 }
@@ -936,31 +937,31 @@ fn client_reattempts_connect_server(
     var r = s.reader(testing.io, &r_buf);
     var w = s.writer(testing.io, &w_buf);
 
-    try expect_request(arena.allocator(), &r.interface, &w.interface, .del, "s", "", .Ok, "");
+    try expectRequest(arena.allocator(), &r.interface, &w.interface, .del, "s", "", .Ok, "");
 
     s.close(testing.io);
 }
 
 test "retries idempotent after half reading response" {
-    var t: Tester = try .init_connection(retries_get_server);
+    var t: Tester = try .init_connection(retriesGetServer);
     defer t.deinit();
 
     try t.client.init(testing.io, try t.str_addr(), .{});
     defer t.client.deinit();
 
     const resp = try t.client.get(t.arena(), "my key");
-    try testing.expectEqual(protocol.ResponseCode.Ok, resp.code);
+    try testing.expectEqual(response.Code.Ok, resp.code);
     try t.join();
 }
 
-fn retries_get_server(srv: *TestServer, t: *TestShared) !void {
+fn retriesGetServer(srv: *TestServer, t: *TestShared) !void {
     var s = try srv.accept();
-    const exp = try protocol.encode.encode_client_msg_alloc(.get, "my key", "", t.arena());
+    const exp = try request.encodeAlloc(.get, "my key", "", t.arena());
     const req = try t.arena().alloc(u8, exp.len);
     try s.r.interface.readSliceAll(req);
     try testing.expectEqualSlices(u8, exp, req);
 
-    const resp = try protocol.encode.encode_srv_msg(t.arena(), .Ok, "");
+    const resp = try response.encode(t.arena(), .Ok, "");
     try s.w.interface.writeAll(resp[0..3]);
     try s.w.interface.flush();
     s.close();
@@ -971,7 +972,7 @@ fn retries_get_server(srv: *TestServer, t: *TestShared) !void {
 }
 
 test "failed request cleans up the socket fd" {
-    var t: Tester = try .init_connection(failed_request_cleans_up_fd);
+    var t: Tester = try .init_connection(failedRequestCleansUpFd);
     defer t.deinit();
 
     try t.client.init(testing.io, try t.str_addr(), .{});
@@ -986,7 +987,7 @@ test "failed request cleans up the socket fd" {
     try t.join();
 }
 
-fn failed_request_cleans_up_fd(srv: *TestServer, t: *TestShared) !void {
+fn failedRequestCleansUpFd(srv: *TestServer, t: *TestShared) !void {
     var s = try srv.accept();
     _ = try s.r.interface.readAlloc(t.arena(), 10);
     try s.w.interface.writeByte('0');
@@ -1000,7 +1001,7 @@ fn failed_request_cleans_up_fd(srv: *TestServer, t: *TestShared) !void {
 }
 
 test "unknown outcome if rst after write" {
-    var t: Tester = try .init_connection(unknown_outcome_error_rst_after_write_server);
+    var t: Tester = try .init_connection(unknownOutcomeErrorRstAfterWriteServer);
     defer t.deinit();
 
     try t.client.init(testing.io, try t.str_addr(), .{});
@@ -1010,10 +1011,10 @@ test "unknown outcome if rst after write" {
     try t.join();
 }
 
-fn unknown_outcome_error_rst_after_write_server(srv: *TestServer, t: *TestShared) !void {
+fn unknownOutcomeErrorRstAfterWriteServer(srv: *TestServer, t: *TestShared) !void {
     var s = try srv.accept();
 
-    const expected = try protocol.encode.encode_client_msg_alloc(
+    const expected = try request.encodeAlloc(
         .set,
         &.{ 255, 0 },
         &.{ 255, 0 },
@@ -1039,7 +1040,7 @@ fn unknown_outcome_error_rst_after_write_server(srv: *TestServer, t: *TestShared
 }
 
 test "unknown outcome if fin after write" {
-    var t: Tester = try .init_connection(unknown_outcome_error_fin_after_write_server);
+    var t: Tester = try .init_connection(unknownOutcomeErrorFinAfterWriteServer);
     defer t.deinit();
 
     try t.client.init(testing.io, try t.str_addr(), .{});
@@ -1049,10 +1050,10 @@ test "unknown outcome if fin after write" {
     try t.join();
 }
 
-fn unknown_outcome_error_fin_after_write_server(srv: *TestServer, t: *TestShared) !void {
+fn unknownOutcomeErrorFinAfterWriteServer(srv: *TestServer, t: *TestShared) !void {
     var s = try srv.accept();
 
-    const expected = try protocol.encode.encode_client_msg_alloc(
+    const expected = try request.encodeAlloc(
         .set,
         &.{ 255, 0 },
         &.{ 255, 0 },

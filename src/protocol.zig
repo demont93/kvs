@@ -19,7 +19,6 @@ const Clock = Io.Clock;
 
 pub const max_key_size = 64 * 1024;
 pub const max_value_size = 16 * 1024 * 1024;
-pub const frame_size = @sizeOf(u32) * 2 + 1;
 
 pub const Op = enum(u8) {
     get = 0,
@@ -34,7 +33,9 @@ pub const Op = enum(u8) {
     }
 };
 
-pub const Request = struct {
+pub const request = struct {
+    pub const frame_size = @sizeOf(u32) * 2 + 1;
+
     pub const InvalidFrame = enum {
         invalid_op,
         key_too_big,
@@ -107,30 +108,61 @@ pub const Request = struct {
             return error.InvalidOp;
         }
     }
-};
 
-pub const ResponseCode = enum(u8) {
-    Ok = 0,
-    NotFound = 1,
-    Invalid = 2,
-    Timeout = 3,
-    Internal = 4,
-};
+    // Assume correct op encoding and key and value length.
+    pub fn encode(
+        op: Op,
+        frame: *[9]u8,
+        key: []const u8,
+        val: []const u8,
+        bufs: *[3][]const u8,
+    ) void {
+        mem.writeInt(u32, frame[0..4], @intCast(key.len + val.len), .big);
+        mem.writeInt(u32, frame[4..8], @intCast(key.len), .big);
+        frame[8] = @intFromEnum(op);
 
-pub const encode = struct {
-    pub const not_found = &[_]u8{ @intFromEnum(ResponseCode.NotFound), 0, 0, 0, 0 };
-    pub const invalid = &[_]u8{ @intFromEnum(ResponseCode.Invalid), 0, 0, 0, 0 };
-    pub const timeout = &[_]u8{ @intFromEnum(ResponseCode.Timeout), 0, 0, 0, 0 };
-    pub const ok = &[_]u8{ @intFromEnum(ResponseCode.Ok), 0, 0, 0, 0 };
-    pub const internal = &[_]u8{ @intFromEnum(ResponseCode.Internal), 0, 0, 0, 0 };
-
-    pub fn value(allocator: Allocator, v: []const u8) error{OutOfMemory}![]u8 {
-        return encode_srv_msg(allocator, .Ok, v);
+        bufs[0] = frame;
+        bufs[1] = key;
+        bufs[2] = val;
     }
 
-    pub fn encode_srv_msg(
+    pub fn encodeAlloc(
+        op: Op,
+        key: []const u8,
+        val: []const u8,
         allocator: Allocator,
-        code: ResponseCode,
+    ) ![]u8 {
+        const len = 9 + key.len + val.len;
+        const buf = try allocator.alloc(u8, len);
+        errdefer allocator.free(buf);
+
+        mem.writeInt(u32, buf[0..4], @intCast(key.len + val.len), .big);
+        mem.writeInt(u32, buf[4..8], @intCast(key.len), .big);
+        buf[8] = @intFromEnum(op);
+        @memcpy(buf[9 .. 9 + key.len], key);
+        @memcpy(buf[9 + key.len ..], val);
+        return buf;
+    }
+};
+
+pub const response = struct {
+    pub const not_found = &[_]u8{ @intFromEnum(Code.NotFound), 0, 0, 0, 0 };
+    pub const invalid = &[_]u8{ @intFromEnum(Code.Invalid), 0, 0, 0, 0 };
+    pub const timeout = &[_]u8{ @intFromEnum(Code.Timeout), 0, 0, 0, 0 };
+    pub const ok = &[_]u8{ @intFromEnum(Code.Ok), 0, 0, 0, 0 };
+    pub const internal = &[_]u8{ @intFromEnum(Code.Internal), 0, 0, 0, 0 };
+
+    pub const Code = enum(u8) {
+        Ok = 0,
+        NotFound = 1,
+        Invalid = 2,
+        Timeout = 3,
+        Internal = 4,
+    };
+
+    pub fn encode(
+        allocator: Allocator,
+        code: Code,
         v: []const u8,
     ) error{OutOfMemory}![]u8 {
         std.debug.assert(switch (code) {
@@ -156,9 +188,13 @@ pub const encode = struct {
         return msg;
     }
 
+    pub fn value(allocator: Allocator, v: []const u8) error{OutOfMemory}![]u8 {
+        return encode(allocator, .Ok, v);
+    }
+
     pub const KeyError = error{ KeyTooLarge, EmptyKey };
 
-    pub fn check_key(key: []const u8) !void {
+    pub fn checkKey(key: []const u8) !void {
         if (key.len > max_key_size) {
             return error.KeyTooLarge;
         }
@@ -169,49 +205,14 @@ pub const encode = struct {
 
     pub const ValueError = error{ValueTooLarge};
 
-    pub fn check_value(val: []const u8) !void {
+    pub fn checkValue(val: []const u8) !void {
         if (val.len > max_value_size) {
             return error.ValueTooLarge;
         }
     }
-
-    // Assume correct op encoding and key and value length.
-    pub fn encode_client_msg(
-        op: Op,
-        frame: *[9]u8,
-        key: []const u8,
-        val: []const u8,
-        bufs: *[3][]const u8,
-    ) void {
-        mem.writeInt(u32, frame[0..4], @intCast(key.len + val.len), .big);
-        mem.writeInt(u32, frame[4..8], @intCast(key.len), .big);
-        frame[8] = @intFromEnum(op);
-
-        bufs[0] = frame;
-        bufs[1] = key;
-        bufs[2] = val;
-    }
-
-    pub fn encode_client_msg_alloc(
-        op: Op,
-        key: []const u8,
-        val: []const u8,
-        allocator: Allocator,
-    ) ![]u8 {
-        const len = 9 + key.len + val.len;
-        const buf = try allocator.alloc(u8, len);
-        errdefer allocator.free(buf);
-
-        mem.writeInt(u32, buf[0..4], @intCast(key.len + val.len), .big);
-        mem.writeInt(u32, buf[4..8], @intCast(key.len), .big);
-        buf[8] = @intFromEnum(op);
-        @memcpy(buf[9 .. 9 + key.len], key);
-        @memcpy(buf[9 + key.len ..], val);
-        return buf;
-    }
 };
 
-pub fn exponential_backoff_with_jitter(
+pub fn exponentialBackoffWithJitter(
     io: Io,
     random: Random,
     attempt: i32,
@@ -219,7 +220,7 @@ pub fn exponential_backoff_with_jitter(
     cap: Duration,
     deadline: Clock.Timestamp,
 ) error{ Canceled, Timeout }!void {
-    const backoff = calculate_exponential_backoff(attempt, base, cap);
+    const backoff = calculateExponentialBackoff(attempt, base, cap);
     const with_jitter = random.intRangeAtMost(
         i96,
         base.nanoseconds,
@@ -238,7 +239,7 @@ pub fn exponential_backoff_with_jitter(
 /// - base > 0
 /// - attempt > 0
 /// - cap > 0
-inline fn calculate_exponential_backoff(attempt: i32, base: Duration, cap: Duration) Duration {
+inline fn calculateExponentialBackoff(attempt: i32, base: Duration, cap: Duration) Duration {
     assert(base.nanoseconds > 0);
     assert(attempt > 0);
     assert(cap.nanoseconds > 0);
@@ -297,7 +298,7 @@ test "exponential backoff correct cap" {
     };
 
     for (&cases) |*c| {
-        const result = calculate_exponential_backoff(
+        const result = calculateExponentialBackoff(
             c.attempt,
             c.base,
             c.cap,
