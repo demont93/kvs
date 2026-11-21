@@ -7,8 +7,9 @@ const debug = std.debug;
 const errno = linux.errno;
 const builtin = @import("builtin");
 const Clock = std.Io.Clock;
+const iovec = std.posix.iovec;
 
-pub fn errno_bug(syscall_name: []const u8, e: linux.E) noreturn {
+pub fn errnoBug(syscall_name: []const u8, e: linux.E) noreturn {
     debug.panic("bug: unexpected error on {s} call: {t}\n", .{ syscall_name, e });
 }
 
@@ -127,7 +128,7 @@ pub fn pollintr(
         .SUCCESS => if (poll_rc == 0) error.Timeout else poll_rc,
         .INTR => error.Intr,
         .INVAL => error.TooManyPollFds,
-        .FAULT => |e| errno_bug("poll", e),
+        .FAULT => |e| errnoBug("poll", e),
         else => |e| record_unexpected_errno(unexpected, e),
     };
 }
@@ -215,7 +216,7 @@ pub fn recv(fd: i32, buf: []u8, unexpected: ?*linux.E) RecvError!usize {
             .CONNREFUSED => error.ConnectionRefused,
             .CONNRESET => error.ConnectionReset,
             .NOMEM => error.OutOfMemory,
-            .FAULT, .NOTCONN, .NOTSOCK => |e| errno_bug("read", e),
+            .FAULT, .NOTCONN, .NOTSOCK => |e| errnoBug("read", e),
             else => |e| record_unexpected_errno(unexpected, e),
         };
     }
@@ -280,10 +281,15 @@ pub fn send_retry(fd: i32, buf: []const u8, unexpected: ?*linux.E) !usize {
             .ISCONN,
             .MSGSIZE,
             .OPNOTSUPP,
-            => |e| errno_bug("write", e),
+            => |e| errnoBug("write", e),
             else => |e| record_unexpected_errno(unexpected, e),
         };
     }
+}
+
+pub fn iovecFromSlice(iov: *iovec, slice: []u8) void {
+    iov.base = slice.ptr;
+    iov.len = slice.len;
 }
 
 test "octet parser" {

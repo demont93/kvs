@@ -15,10 +15,32 @@ const Clock = Io.Clock.awake;
 const BufMap = std.BufMap;
 const encode = protocol.encode;
 const syscall = @import("syscall.zig");
+const iovec = std.posix.iovec;
+const ArrayList = std.ArrayList;
 
 const protocol = @import("protocol.zig");
 
 const Self = @This();
+
+/// Assumes that the process is single threaded. If the server gets more threads, the signal may
+/// land in any thread. While the variable will be set, the poll or connect may not get INTR'd.
+var stop: std.atomic.Value(bool) = .init(false);
+
+io: Io,
+listener: Listener,
+mem_buf: []align(std.atomic.cache_line) u8,
+request_bufs: RequestBuffers,
+drain_buf: []u8,
+read_timeout: Io.Duration,
+write_timeout: Io.Duration,
+idle_timeout: Io.Duration,
+grace_period: Io.Duration,
+parser: protocol.Parser,
+allocator: Allocator,
+retry_state: RetryState,
+unexpected_errno: linux.E,
+
+map: BufMap,
 
 pub const Listener = struct {
     /// Expected to be initialized in non-blocking mode.
@@ -31,11 +53,11 @@ pub const Listener = struct {
             Unexpected,
         };
 
-        pub fn read(self: *Connection, buf: []u8, unexpected: *linux.E) RwError!usize {
-            return while (true) {
-                const read_rc = linux.read(self.sock_fd, buf.ptr, buf.len);
-                switch (linux.errno(read_rc)) {
-                    .SUCCESS => break read_rc,
+        pub fn readv(self: *Connection, iovs: []iovec, unexpected: *linux.E) RwError!usize {
+            while (true) {
+                const readv_rc = linux.readv(self.sock_fd, iovs.ptr, iovs.len);
+                switch (linux.errno(readv_rc)) {
+                    .SUCCESS => return readv_rc,
                     .INTR => continue,
                     .CONNRESET, .PIPE => return RwError.ConnectionReset,
                     .AGAIN => return RwError.WouldBlock,
@@ -44,10 +66,29 @@ pub const Listener = struct {
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| syscall.errno_bug("read", e),
+                    => |e| syscall.errnoBug("read", e),
                     else => |e| return syscall.record_unexpected_errno(unexpected, e),
                 }
-            };
+            }
+        }
+
+        pub fn read(self: *Connection, buf: []u8, unexpected: *linux.E) RwError!usize {
+            while (true) {
+                const read_rc = linux.read(self.sock_fd, buf.ptr, buf.len);
+                switch (linux.errno(read_rc)) {
+                    .SUCCESS => return read_rc,
+                    .INTR => continue,
+                    .CONNRESET, .PIPE => return RwError.ConnectionReset,
+                    .AGAIN => return RwError.WouldBlock,
+                    .BADF,
+                    .FAULT,
+                    .NOTSOCK,
+                    .INVAL,
+                    .NOTCONN,
+                    => |e| syscall.errnoBug("read", e),
+                    else => |e| return syscall.record_unexpected_errno(unexpected, e),
+                }
+            }
         }
 
         pub fn write(self: *Connection, buf: []const u8, unexpected: *linux.E) RwError!usize {
@@ -63,7 +104,7 @@ pub const Listener = struct {
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| syscall.errno_bug("write", e),
+                    => |e| syscall.errnoBug("write", e),
                     else => |e| return syscall.record_unexpected_errno(unexpected, e),
                 }
             };
@@ -75,7 +116,7 @@ pub const Listener = struct {
             const shut_rc = linux.shutdown(self.sock_fd, linux.SHUT.WR);
             switch (linux.errno(shut_rc)) {
                 .SUCCESS, .NOTCONN => {},
-                else => |e| syscall.errno_bug("shutdown", e),
+                else => |e| syscall.errnoBug("shutdown", e),
             }
         }
 
@@ -83,7 +124,7 @@ pub const Listener = struct {
             const rc = linux.close(self.sock_fd);
             switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| syscall.errno_bug("close", e),
+                .BADF => |e| syscall.errnoBug("close", e),
                 else => |e| logErr("closing connection", e),
             }
             self.sock_fd = -1;
@@ -109,7 +150,7 @@ pub const Listener = struct {
             .ACCES => return BindError.PermissionDenied,
             .MFILE, .NFILE => return BindError.TooManyOpenFiles,
             .NOBUFS, .NOMEM => return BindError.InsufficientMemory,
-            else => |e| syscall.errno_bug("socket", e),
+            else => |e| syscall.errnoBug("socket", e),
         }
 
         const optval: c_int = 1;
@@ -122,7 +163,7 @@ pub const Listener = struct {
         );
         switch (linux.errno(sso_rc)) {
             .SUCCESS => {},
-            else => |e| syscall.errno_bug("setsockopt", e),
+            else => |e| syscall.errnoBug("setsockopt", e),
         }
 
         const sock_addr = syscall.parse_addr(addr) orelse return BindError.InvalidAddress;
@@ -136,14 +177,14 @@ pub const Listener = struct {
             .ACCES, .ADDRNOTAVAIL, .FAULT => return BindError.InvalidAddress,
             .ADDRINUSE => return BindError.AddressInUse,
             .NOMEM => return BindError.InsufficientMemory,
-            else => |e| syscall.errno_bug("bind", e),
+            else => |e| syscall.errnoBug("bind", e),
         }
 
         const listen_rc = linux.listen(self.sock_fd, self.backlog);
         switch (linux.errno(listen_rc)) {
             .SUCCESS => {},
             .ADDRINUSE => return BindError.AddressInUse,
-            else => |e| syscall.errno_bug("listen", e),
+            else => |e| syscall.errnoBug("listen", e),
         }
     }
 
@@ -188,7 +229,7 @@ pub const Listener = struct {
                 .OPNOTSUPP,
                 .PROTO,
                 .AGAIN,
-                => |e| syscall.errno_bug("accept", e),
+                => |e| syscall.errnoBug("accept", e),
                 else => |e| {
                     logErr("unexpected accept error", e);
                     continue;
@@ -205,7 +246,7 @@ pub const Listener = struct {
             const close_rc = linux.close(self.sock_fd);
             switch (linux.errno(close_rc)) {
                 .SUCCESS, .INTR => {},
-                .BADF => |e| syscall.errno_bug("close", e),
+                .BADF => |e| syscall.errnoBug("close", e),
                 else => |e| logErr("closing listener", e),
             }
         }
@@ -222,36 +263,360 @@ pub const Listener = struct {
             .SUCCESS => {},
             .FAULT, .INVAL => return AddrError.InvalidAddr,
             .NOBUFS => return AddrError.InsufficientMemory,
-            else => |e| syscall.errno_bug("getsockname", e),
+            else => |e| syscall.errnoBug("getsockname", e),
         }
     }
 };
 
-const BufReader = struct {
-    start: usize = 0,
-    end: usize = 0,
-    buf: []u8,
+const Request = struct {
+    op: protocol.Op,
+    key: []u8,
+    value: ?[]u8,
+};
 
-    inline fn write(self: *BufReader) []u8 {
-        self.start = 0;
-        self.end = 0;
-        return self.buf;
+const RequestBuffers = struct {
+    frame_buffer: [protocol.frame_size]u8 = undefined,
+    frame: ArrayList(u8),
+
+    tail: TailBuffer,
+
+    key_buf: ?[]u8 = null,
+    key: ?ArrayList(u8),
+
+    value_buf: ?[]u8 = null,
+    value: ?ArrayList(u8),
+
+    iovec_buf: [3]iovec = undefined,
+    iovecs: ArrayList(iovec),
+
+    stage: enum { frame, kv } = .frame,
+
+    err_reason: ?Diagnostics,
+
+    const Diagnostics = union(enum) {
+        parse: protocol.Request2.InvalidFrame,
+        oom,
+    };
+
+    const TailBuffer = struct {
+        r: usize = 0,
+        w: usize = 0,
+        buf: []u8,
+
+        fn writeRegion(self: *TailBuffer, iovs: *ArrayList(iovec)) error{TailBufferFull}!void {
+            const cap = self.buf.len;
+            const mask = cap - 1;
+
+            const len = self.unused();
+
+            const wi = self.w & mask;
+
+            const first = @min(len, cap - wi);
+            const second = len - first;
+
+            if (first == 0 and second == 0) return error.TailBufferFull;
+
+            if (first > 0) {
+                const s = iovs.addOneAssumeCapacity();
+                syscall.iovecFromSlice(s, self.buf[wi..][0..first]);
+            }
+
+            if (second > 0) {
+                const s = iovs.addOneAssumeCapacity();
+                syscall.iovecFromSlice(s, self.buf[0..second]);
+            }
+        }
+
+        fn commit(self: *TailBuffer, n: usize) void {
+            self.w +%= n;
+        }
+
+        fn unused(self: TailBuffer) usize {
+            return self.buf.len - (self.w -% self.r);
+        }
+
+        fn read(self: *TailBuffer, b: []u8) usize {
+            const cap = self.buf.len;
+            const mask = cap - 1;
+
+            const len = self.w -% self.r;
+            const to_read = @min(len, b.len);
+
+            const ri = self.r & mask;
+
+            const first = @min(to_read, cap - ri);
+            const second = to_read - first;
+
+            @memcpy(b[0..first], self.buf[ri..][0..first]);
+            @memcpy(b[first..][0..second], self.buf[0..second]);
+
+            self.r +%= to_read;
+
+            return to_read;
+        }
+
+        fn reset(self: *TailBuffer) void {
+            self.r = 0;
+            self.w = 0;
+        }
+    };
+
+    fn init(self: *RequestBuffers, tail_buf: []u8) void {
+        assert(std.math.isPowerOfTwo(tail_buf.len));
+        self.tail = .{ .buf = tail_buf };
+        self.frame = .initBuffer(&self.frame_buffer);
+        self.iovecs = .initBuffer(&self.iovec_buf);
+        self.err_reason = null;
+        self.stage = .frame;
+        self.key = null;
+        self.key_buf = null;
+        self.value = null;
+        self.value_buf = null;
     }
 
-    inline fn markWritten(self: *BufReader, size: usize) void {
-        self.end = size;
+    fn deinit(self: *RequestBuffers, allocator: Allocator) void {
+        if (self.key_buf) |kb| {
+            allocator.free(kb);
+        }
+        self.key = null;
+        self.key_buf = null;
+        if (self.value_buf) |vb| {
+            allocator.free(vb);
+        }
+        self.value = null;
+        self.value_buf = null;
     }
 
-    /// Consumes given contents.
-    fn contents(self: *BufReader, size: usize) []u8 {
-        const start = self.start;
-        self.start = @min(self.start + size, self.end);
-        return self.buf[start..self.start];
+    fn reset(self: *RequestBuffers, allocator: Allocator) void {
+        self.deinit(allocator);
+        self.frame.items.len = 0;
+        self.tail.reset();
+        self.iovecs.items.len = 0;
+        self.stage = .frame;
+        self.err_reason = null;
     }
 
-    fn reset(self: *BufReader) void {
-        self.start = 0;
-        self.end = 0;
+    fn done(self: *RequestBuffers) bool {
+        return self.err_reason != null or
+            (full(self.frame) and
+                self.key != null and
+                full(self.key.?) and
+                (self.value == null or full(self.value.?)));
+    }
+
+    fn claimRequest(self: *RequestBuffers, allocator: Allocator, diag: ?*Diagnostics) ?Request {
+        if (self.err_reason) |r| {
+            if (diag) |d| {
+                d.* = r;
+                return null;
+            }
+        }
+
+        assert(full(self.frame));
+        assert(self.key != null and full(self.key.?));
+        assert(self.value == null or full(self.value.?));
+        assert(self.stage == .kv);
+
+        const req: Request = .{
+            .op = protocol.Request2.frameOp(self.frame_buffer),
+            .key = self.key_buf.?,
+            .value = self.value_buf,
+        };
+
+        self.stage = .frame;
+        self.iovecs.items.len = 0;
+        self.key_buf = null;
+        self.key = null;
+        self.value_buf = null;
+        self.value = null;
+        self.frame.items.len = 0;
+
+        self.frame.items.len += self.tail.read(self.frame.unusedCapacitySlice());
+
+        if (full(self.frame)) {
+            _ = self.transitionKvStage(allocator);
+        }
+
+        return req;
+    }
+
+    fn writeRegion(self: *RequestBuffers) ?[]iovec {
+        if (self.iovecs.items.len == 0) {
+            switch (self.stage) {
+                .frame => self.createFrameStageIovecs(),
+                .kv => self.createKvStageIovecs(),
+            }
+        }
+        return self.iovecs.items;
+    }
+
+    fn commit(self: *RequestBuffers, allocator: Allocator, n: usize) void {
+        var to_commit = n;
+        const iovs = self.iovecs.items;
+        var remaining: usize = 0;
+
+        for (iovs) |*iov| {
+            const len = @min(to_commit, iov.len);
+            iov.base += len;
+            iov.len -= len;
+            to_commit -= len;
+            remaining += iov.len;
+        }
+
+        assert(to_commit == 0);
+
+        if (self.stage == .frame and iovs[0].len == 0) {
+            self.commitFrameStageIovecs();
+            _ = self.transitionKvStage(allocator);
+        } else if (self.stage == .kv and remaining == 0) {
+            self.commitKvStageIovecs();
+        }
+    }
+
+    fn commitKvStageIovecs(self: *RequestBuffers) void {
+        self.key.?.expandToCapacity();
+        if (self.value) |*v| {
+            v.expandToCapacity();
+        }
+        self.iovecs.items.len = 0;
+    }
+
+    fn commitFrameStageIovecs(self: *RequestBuffers) void {
+        self.frame.items.len = self.frame.capacity - self.iovecs.items[0].len;
+
+        var remaining_tail: usize = 0;
+        for (self.iovecs.items[1..]) |*iov| {
+            remaining_tail += iov.len;
+        }
+
+        self.tail.commit(self.tail.unused() - remaining_tail);
+
+        self.iovecs.items.len = 0;
+    }
+
+    fn transitionKvStage(self: *RequestBuffers, allocator: Allocator) bool {
+        self.stage = .kv;
+
+        var reason: protocol.Request2.InvalidFrame = undefined;
+        if (!protocol.Request2.validateFrame(self.frame_buffer, &reason)) {
+            self.err_reason = .{ .parse = reason };
+            return false;
+        }
+
+        const kl = protocol.Request2.frameKeyLen(self.frame_buffer);
+        self.key_buf = allocator.alloc(u8, kl) catch {
+            self.err_reason = .oom;
+            return false;
+        };
+        self.key = .initBuffer(self.key_buf.?);
+
+        const vl = protocol.Request2.frameValueLen(self.frame_buffer);
+        if (vl > 0) {
+            self.value_buf = allocator.alloc(u8, vl) catch {
+                self.err_reason = .oom;
+                return false;
+            };
+            self.value = .initBuffer(self.value_buf.?);
+        }
+
+        self.key.?.items.len += self.tail.read(self.key.?.unusedCapacitySlice());
+
+        if (self.value) |*v| {
+            v.items.len += self.tail.read(v.unusedCapacitySlice());
+        }
+
+        return true;
+    }
+
+    fn createFrameStageIovecs(self: *RequestBuffers) void {
+        appendUnused(&self.iovecs, self.frame);
+        self.tail.writeRegion(&self.iovecs) catch unreachable;
+    }
+
+    fn createKvStageIovecs(self: *RequestBuffers) void {
+        appendUnused(&self.iovecs, self.key.?);
+        if (self.value) |*v| {
+            appendUnused(&self.iovecs, v.*);
+        }
+    }
+
+    inline fn full(lst: ArrayList(u8)) bool {
+        return lst.items.len == lst.capacity;
+    }
+
+    inline fn appendUnused(lst: *ArrayList(iovec), s: ArrayList(u8)) void {
+        const ptr = lst.addOneAssumeCapacity();
+        syscall.iovecFromSlice(ptr, s.unusedCapacitySlice());
+    }
+
+    inline fn unusedCapacity(lst: ArrayList(u8)) usize {
+        return lst.capacity - lst.items.len;
+    }
+
+    test "parse errors" {
+        var rb: RequestBuffers = undefined;
+        var tail_buf: [64]u8 = undefined;
+        rb.init(&tail_buf);
+
+        try testing.expect(!rb.done());
+
+        const region = rb.writeRegion();
+        const n = testWriteIovs(region.?, &[_]u8{0} ** 10);
+        rb.commit(testing.allocator, n);
+
+        try testing.expect(rb.done());
+        var diag: Diagnostics = undefined;
+        try testing.expectEqual(null, rb.claimRequest(testing.allocator, &diag));
+        try testing.expectEqual(protocol.Request2.InvalidFrame.malformed, diag.parse);
+
+        rb.reset(testing.allocator);
+        const region2 = rb.writeRegion();
+        const n2 = testWriteIovs(region2.?, "\x00\x00\x00\x00\x00\x00\x00\x01\x00");
+        rb.commit(testing.allocator, n2);
+        try testing.expect(rb.done());
+    }
+
+    test "batched request is retained" {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+
+        var rb: RequestBuffers = undefined;
+        var tail_buf: [64]u8 = undefined;
+        rb.init(&tail_buf);
+
+        try testing.expect(!rb.done());
+
+        const msg = try protocol.encode.encode_client_msg_alloc(.get, "hello", "", arena.allocator());
+        const msg2 = try protocol.encode.encode_client_msg_alloc(.get, "hola", "", arena.allocator());
+        const merged = try std.mem.concat(arena.allocator(), u8, &.{ msg, msg2 });
+
+        const region = rb.writeRegion();
+        const n = testWriteIovs(region.?, merged);
+        rb.commit(testing.allocator, n);
+
+        try testing.expect(rb.done());
+        const req = rb.claimRequest(testing.allocator, null).?;
+        defer testing.allocator.free(req.key);
+        try testing.expectEqualSlices(u8, "hello", req.key);
+
+        try testing.expect(rb.done());
+        const req2 = rb.claimRequest(testing.allocator, null).?;
+        defer testing.allocator.free(req2.key);
+        try testing.expectEqualSlices(u8, "hola", req2.key);
+
+        try testing.expect(!rb.done());
+    }
+
+    fn testWriteIovs(iovs: []iovec, buf: []const u8) usize {
+        var i: usize = 0;
+        for (iovs) |*iov| {
+            const len = @min(iov.len, buf.len - i);
+            @memcpy(iov.base, buf[i..][0..len]);
+            i += len;
+            if (i == buf.len) break;
+        }
+
+        return i;
     }
 };
 
@@ -265,21 +630,19 @@ pub const ServerOpts = struct {
 };
 
 const Action = enum {
-    FirstRead,
-    SubsequentReads,
-    Parse,
-    Write,
-    Encode,
-    Handler,
+    first_read,
+    subsequent_reads,
+    write,
+    encode,
+    handler,
 
     fn description(self: Action) []const u8 {
         return switch (self) {
-            .FirstRead => "reading request after idle",
-            .SubsequentReads => "reading remaining request",
-            .Parse => "parsing request",
-            .Write => "writing response",
-            .Encode => "encoding response",
-            .Handler => "handling request",
+            .first_read => "reading request after idle",
+            .subsequent_reads => "reading remaining request",
+            .write => "writing response",
+            .encode => "encoding response",
+            .handler => "handling request",
         };
     }
 };
@@ -315,26 +678,6 @@ const RetryState = struct {
     }
 };
 
-/// Assumes that the process is single threaded. If the server gets more threads, the signal may
-/// land in any thread. While the variable will be set, the poll or connect may not get INTR'd.
-var stop: std.atomic.Value(bool) = .init(false);
-
-io: Io,
-listener: Listener,
-mem_buf: []align(std.atomic.cache_line) u8,
-read_buf: BufReader,
-drain_buf: []u8,
-read_timeout: Io.Duration,
-write_timeout: Io.Duration,
-idle_timeout: Io.Duration,
-grace_period: Io.Duration,
-parser: protocol.Parser,
-allocator: Allocator,
-retry_state: RetryState,
-unexpected_errno: linux.E,
-
-map: BufMap,
-
 pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{OutOfMemory}!void {
     self.io = io;
     self.allocator = allocator;
@@ -350,7 +693,7 @@ pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{O
         .fromByteUnits(std.atomic.cache_line),
         mem_size.size,
     );
-    self.read_buf = .{ .buf = self.mem_buf[0..mem_size.split] };
+    self.request_bufs.init(self.mem_buf[0..mem_size.split]);
     self.drain_buf = self.mem_buf[mem_size.split..];
 
     self.read_timeout = opts.read_timeout;
@@ -391,6 +734,7 @@ pub fn serve(self: *Self) void {
         conn.close();
         result catch |e| {
             switch (e) {
+                error.IdleTimeout => {},
                 error.Unexpected => log(
                     "connection error: unexpected {t}",
                     .{self.unexpected_errno},
@@ -440,6 +784,7 @@ fn listenAndServeOne(
 }
 
 pub fn close(self: *Self) void {
+    self.request_bufs.deinit(self.allocator);
     self.listener.close();
     self.allocator.free(self.mem_buf);
     self.map.deinit();
@@ -459,11 +804,11 @@ fn installSigHandler() void {
     };
     switch (linux.errno(linux.sigaction(.INT, &act, null))) {
         .SUCCESS => {},
-        else => |e| syscall.errno_bug("sigaction", e),
+        else => |e| syscall.errnoBug("sigaction", e),
     }
     switch (linux.errno(linux.sigaction(.TERM, &act, null))) {
         .SUCCESS => {},
-        else => |e| syscall.errno_bug("sigaction", e),
+        else => |e| syscall.errnoBug("sigaction", e),
     }
 }
 
@@ -476,10 +821,12 @@ const RequestError = error{
     ConnectionReset,
     ReadTimeout,
     WriteTimeout,
+    IdleTimeout,
     OutOfMemory,
     BadRequest,
     Unexpected,
     Stop,
+    Finished,
 };
 
 fn handleConnection(
@@ -487,16 +834,16 @@ fn handleConnection(
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
 ) RequestError!void {
-    var result: RequestResult = .Continue;
-    defer self.read_buf.reset();
-    while (result == .Continue) {
+    var result: RequestResult = .cont;
+    defer self.request_bufs.reset(self.allocator);
+    while (result == .cont) {
         result = try self.handleRequest(conn, diag);
     }
 }
 
 const RequestResult = enum {
-    Done,
-    Continue,
+    done,
+    cont,
 };
 
 fn handleRequest(
@@ -504,30 +851,19 @@ fn handleRequest(
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
 ) RequestError!RequestResult {
-    var req = protocol.Request{};
-    defer {
-        if (req.buf) |buf| {
-            self.allocator.free(buf);
-        }
-    }
-
-    const read_result = self.readRequest(conn, diag, &req) catch |err| {
+    const request = self.readRequest(conn, diag) catch |err| {
         const error_response = switch (err) {
+            error.Finished => return .done,
             error.ConnectionReset, error.Unexpected, error.Stop => |e| return e,
             error.OutOfMemory => encode.internal,
             error.BadRequest => encode.invalid,
-            error.ReadTimeout => encode.timeout,
+            error.ReadTimeout, error.IdleTimeout => encode.timeout,
         };
         self.writeDrain(conn, error_response);
-        return @errorCast(err);
+        return err;
     };
 
-    switch (read_result) {
-        .Done => |r| return r,
-        .Continue => {},
-    }
-
-    const response, const free = self.handler(&req, diag) catch |e| {
+    const response, const free = self.handler(request, diag) catch |e| {
         self.writeDrain(conn, protocol.encode.internal);
         return e;
     };
@@ -536,23 +872,25 @@ fn handleRequest(
     }
 
     self.writeAll(conn, response) catch |err| {
-        diag.record(.Write, err);
+        diag.record(.write, err);
         return @errorCast(err);
     };
 
-    return .Continue;
+    return .cont;
 }
 
 fn handler(
     self: *Self,
-    req: *protocol.Request,
+    req: Request,
     diag: *ConnectionDiagnostics,
 ) !struct { []const u8, bool } {
     switch (req.op) {
         .get => {
-            if (self.map.get(req.key())) |v| {
+            defer self.allocator.free(req.key);
+
+            if (self.map.get(req.key)) |v| {
                 const msg = encode.value(self.allocator, v) catch |err| {
-                    diag.record(.Encode, err);
+                    diag.record(.encode, err);
                     return err;
                 };
                 return .{ msg, true };
@@ -561,7 +899,9 @@ fn handler(
             }
         },
         .del => {
-            if (self.map.hash_map.fetchRemove(req.key())) |kv| {
+            defer self.allocator.free(req.key);
+
+            if (self.map.hash_map.fetchRemove(req.key)) |kv| {
                 self.map.hash_map.allocator.free(kv.key);
                 self.map.hash_map.allocator.free(kv.value);
                 return .{ encode.ok, false };
@@ -570,10 +910,12 @@ fn handler(
             }
         },
         .set => {
-            if (self.map.put(req.key(), req.value())) |_| {
+            if (self.map.putMove(req.key, req.value.?)) |_| {
                 return .{ encode.ok, false };
             } else |e| {
-                diag.record(.Handler, e);
+                self.allocator.free(req.key);
+                self.allocator.free(req.value.?);
+                diag.record(.handler, e);
                 return e;
             }
         },
@@ -585,60 +927,113 @@ const ReadRequestError = error{
     OutOfMemory,
     BadRequest,
     ReadTimeout,
+    IdleTimeout,
     Unexpected,
     Stop,
+    Finished,
+};
+
+const Stoppable = enum {
+    stoppable,
+    non_stoppable,
 };
 
 fn readRequest(
     self: *Self,
     conn: *Listener.Connection,
     diag: *ConnectionDiagnostics,
-    req: *protocol.Request,
-) ReadRequestError!RequestResult {
-    self.parser.reset();
+) ReadRequestError!Request {
+    const idle_deadline = self.make_deadline(self.idle_timeout);
+    var fds: [1]linux.pollfd = .{syscall.pollfd(conn.sock_fd, linux.POLL.IN)};
 
-    // First Read
-    var done, const deadline = first_read: {
-        const idle_deadline = self.make_deadline(self.idle_timeout);
-        var chunk = self.readBuffered(
-            conn,
-            self.parser.bytes_required(),
-            idle_deadline,
-        ) catch |e| {
-            const err = switch (e) {
-                error.ReadTimeout => return .Done,
-                else => |err| return err,
+    if (!self.request_bufs.done()) {
+        const n_read = self.readConnection(conn, &fds, idle_deadline, .stoppable) catch |err| {
+            const e = switch (err) {
+                error.Stop, error.Unexpected, error.OutOfMemory, error.ConnectionReset => |e| e,
+                error.Timeout => error.IdleTimeout,
             };
-            diag.record(.FirstRead, err);
-            return err;
-        };
-        if (chunk.len == 0) {
-            return .Done;
-        }
-        const deadline = self.make_deadline(self.read_timeout);
-
-        const done = self.parser.parse(self.allocator, chunk, req) catch |e|
-            return handleParseErr(e, diag);
-
-        break :first_read .{ done, deadline };
-    };
-
-    // Subsequent reads
-    while (!done) {
-        const needed = self.parser.bytes_required();
-        const chunk = self.readBuffered(conn, needed, deadline) catch |e| {
-            diag.record(.SubsequentReads, e);
+            diag.record(.first_read, e);
             return e;
         };
-        if (chunk.len == 0) {
-            diag.record(.SubsequentReads, error.UnexpectedEof);
-            return error.BadRequest;
+
+        if (n_read == 0) {
+            return error.Finished;
         }
-        done = self.parser.parse(self.allocator, chunk, req) catch |e|
-            return handleParseErr(e, diag);
+
+        self.request_bufs.commit(self.allocator, n_read);
     }
 
-    return .Continue;
+    const read_deadline = self.make_deadline(self.read_timeout);
+
+    while (!self.request_bufs.done()) {
+        const n_read = self.readConnection(conn, &fds, read_deadline, .non_stoppable) catch |err| {
+            const e = switch (err) {
+                error.Stop => |e| return e,
+                error.Unexpected, error.OutOfMemory, error.ConnectionReset => |e| e,
+                error.Timeout => error.ReadTimeout,
+            };
+            diag.record(.subsequent_reads, e);
+            return e;
+        };
+
+        if (n_read == 0) {
+            diag.record(.subsequent_reads, error.UnexpectedEof);
+            return error.BadRequest;
+        }
+
+        self.request_bufs.commit(self.allocator, n_read);
+    }
+
+    var rb_diag: RequestBuffers.Diagnostics = undefined;
+    return self.request_bufs.claimRequest(self.allocator, &rb_diag) orelse {
+        const err = switch (rb_diag) {
+            .oom => error.OutOfMemory,
+            .parse => error.BadRequest,
+        };
+        diag.record(.subsequent_reads, err);
+        return err;
+    };
+}
+
+const ReadConnectionError = error{
+    ConnectionReset,
+    Unexpected,
+    Timeout,
+    OutOfMemory,
+    Stop,
+};
+
+fn readConnection(
+    self: *Self,
+    conn: *Listener.Connection,
+    fds: *[1]linux.pollfd,
+    deadline: Io.Clock.Timestamp,
+    stoppable: Stoppable,
+) ReadConnectionError!usize {
+    return while (true) {
+        const iovs = self.request_bufs.writeRegion().?;
+        const read_result = conn.readv(iovs, &self.unexpected_errno);
+
+        if (read_result) |n| break n else |err| switch (err) {
+            error.WouldBlock => {},
+            error.ConnectionReset, error.Unexpected => |e| return e,
+        }
+
+        while (true) {
+            if (stoppable == .stoppable and stop.load(.monotonic)) return error.Stop;
+            _ = syscall.pollintr(
+                self.io,
+                fds,
+                deadline,
+                &self.unexpected_errno,
+            ) catch |err| switch (err) {
+                error.Intr => continue,
+                error.TooManyPollFds => return syscall.errnoBug("poll", linux.E.INVAL),
+                error.Timeout, error.OutOfMemory, error.Unexpected => |e| return e,
+            };
+            break;
+        }
+    };
 }
 
 const ParseError = error{
@@ -652,7 +1047,7 @@ fn handleParseErr(err: protocol.ParseError, diag: *ConnectionDiagnostics) ParseE
         error.OutOfMemory => |e| e,
         error.RequestBufInitialized => @panic("request buffer started initialized"),
     };
-    diag.record(.Parse, err);
+    diag.record(.parse, err);
     return e;
 }
 
@@ -701,7 +1096,7 @@ fn readBuffered(
 
             n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
                 error.Unexpected => |err| return err,
-                error.WouldBlock => syscall.errno_bug("read", linux.E.AGAIN),
+                error.WouldBlock => syscall.errnoBug("read", linux.E.AGAIN),
                 else => |e| return e,
             };
         }
@@ -880,7 +1275,7 @@ test "slow writing client gets read timeout" {
         &response,
     );
     try testing.expectError(error.ReadTimeout, t.close());
-    try testing.expectEqual(Action.SubsequentReads, t.diag.action);
+    try testing.expectEqual(Action.subsequent_reads, t.diag.action);
     try testing.expectEqual(error.ReadTimeout, t.diag.details);
 }
 
@@ -900,7 +1295,7 @@ test "slow reading client gets write timeout" {
     try r.interface.readSliceAll(&response);
     try testing.io.sleep(.fromMilliseconds(400), .awake);
     try testing.expectError(error.WriteTimeout, t.close());
-    try testing.expectEqual(Action.Write, t.diag.action);
+    try testing.expectEqual(Action.write, t.diag.action);
     try testing.expectEqual(error.WriteTimeout, t.diag.details);
 }
 
@@ -914,8 +1309,8 @@ test "large invalid request gets rst" {
     try testing.expectError(error.WriteFailed, w.interface.writeAll(large));
     try testing.expectEqual(error.SocketUnconnected, w.err.?);
     try testing.expectError(error.BadRequest, t.close());
-    try testing.expectEqual(Action.Parse, t.diag.action);
-    try testing.expectEqual(error.InvalidRequest, t.diag.details);
+    try testing.expectEqual(Action.subsequent_reads, t.diag.action);
+    try testing.expectEqual(error.BadRequest, t.diag.details);
 }
 
 test "a small invalid request closes gracefully" {
@@ -932,8 +1327,8 @@ test "a small invalid request closes gracefully" {
     var eofbuf: [1]u8 = undefined;
     try testing.expectError(error.EndOfStream, r.interface.readSliceAll(&eofbuf));
     try testing.expectError(error.BadRequest, t.close());
-    try testing.expectEqual(Action.Parse, t.diag.action);
-    try testing.expectEqual(error.InvalidRequest, t.diag.details);
+    try testing.expectEqual(Action.subsequent_reads, t.diag.action);
+    try testing.expectEqual(error.BadRequest, t.diag.details);
 }
 
 test "many requests on the same connection" {
@@ -1000,7 +1395,7 @@ test "idle connection timeout" {
     try testing.expectError(error.WriteFailed, w.interface.flush());
     try testing.expectEqual(error.SocketUnconnected, w.err.?);
 
-    try t.close();
+    try testing.expectError(error.IdleTimeout, t.close());
 }
 
 test "data doesn't leak into next connection" {

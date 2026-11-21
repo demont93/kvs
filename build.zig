@@ -178,6 +178,7 @@ pub fn build(b: *std.Build) void {
     // Profile server responses
     const profile_response = b.addExecutable(.{
         .name = "profile-response",
+        .use_llvm = true,
         .root_module = b.createModule(.{
             .root_source_file = b.path("prof/response/src/main.zig"),
             .target = target,

@@ -282,7 +282,7 @@ fn connect(self: *Self, req: *Request) ConnectError!void {
     const socket_rc = syscall.socket(.NonBlocking);
     switch (errno(socket_rc)) {
         .SUCCESS => {},
-        .INVAL, .PROTONOSUPPORT => |e2| syscall.errno_bug("socket", e2),
+        .INVAL, .PROTONOSUPPORT => |e2| syscall.errnoBug("socket", e2),
         else => |e| {
             req.log_err(e);
             switch (e) {
@@ -337,7 +337,7 @@ fn connect(self: *Self, req: *Request) ConnectError!void {
     );
     switch (errno(gso_rc)) {
         .SUCCESS => {},
-        else => |e| syscall.errno_bug("getsockopt", e),
+        else => |e| syscall.errnoBug("getsockopt", e),
     }
 
     const sock_err: linux.E = @enumFromInt(raw_sock_err);
@@ -360,7 +360,7 @@ fn handle_connect_errno(req: *Request, err: linux.E) ConnectError {
         .ISCONN,
         .NOTSOCK,
         .PROTOTYPE,
-        => |e| syscall.errno_bug("connect", e),
+        => |e| syscall.errnoBug("connect", e),
 
         else => |e| {
             req.log_err(e);
@@ -419,7 +419,7 @@ fn writev_all(self: *Self, data: *[3][]const u8, req: *Request) WriteError!void 
             .MSGSIZE,
             .OPNOTSUPP,
             .FAULT,
-            => |e2| syscall.errno_bug("writev", e2),
+            => |e2| syscall.errnoBug("writev", e2),
 
             else => |e| {
                 req.log_err(e);
@@ -555,7 +555,7 @@ fn close_fd(self: *Self) void {
     switch (errno(close_rc)) {
         .SUCCESS => {},
         .INTR, .IO => |e| std.debug.print("closing client fd: {t}", .{e}),
-        else => |e| syscall.errno_bug("close", e),
+        else => |e| syscall.errnoBug("close", e),
     }
     self.sock_fd = -1;
 }

@@ -20,6 +20,7 @@ const Clock = Io.Clock;
 pub const max_key_size = 64 * 1024;
 pub const max_value_size = 16 * 1024 * 1024;
 pub const parser_buf_size = 1024;
+pub const frame_size = @sizeOf(u32) * 2 + 1;
 
 pub const Op = enum(u8) {
     get = 0,
@@ -59,7 +60,7 @@ pub const ParseError = error{
 };
 
 pub const Parser = struct {
-    frame_buf: [@sizeOf(u32) * 2 + 1]u8 = undefined,
+    frame_buf: [frame_size]u8 = undefined,
     frame_index: u32 = 0,
     body_index: u32 = 0,
 
@@ -163,19 +164,97 @@ pub const Parser = struct {
     }
 
     inline fn get_frame(self: *Parser) error{InvalidOp}!struct { u32, u32, Op } {
-        const size_u32 = @sizeOf(u32);
-        const bl = mem.readInt(u32, self.frame_buf[0..size_u32], .big);
-        const kl = mem.readInt(u32, self.frame_buf[size_u32 .. size_u32 * 2], .big);
-        const op = enums.fromInt(
-            Op,
-            self.frame_buf[self.frame_buf.len - 1],
-        ) orelse return error.InvalidOp;
-        return .{ bl, kl, op };
+        return getFrame(self.frame_buf);
     }
-
     // Returns the body length from the frame buffer which is assumed to be full.
     inline fn body_length(self: *Parser) u32 {
         return mem.readInt(u32, self.frame_buf[0..@sizeOf(u32)], .big);
+    }
+
+    inline fn getFrame(frame: [frame_size]u8) error{InvalidOp}!struct { u32, u32, Op } {
+        const size_u32 = @sizeOf(u32);
+        const bl = mem.readInt(u32, frame[0..size_u32], .big);
+        const kl = mem.readInt(u32, frame[size_u32 .. size_u32 * 2], .big);
+        const op = enums.fromInt(
+            Op,
+            frame[frame.len - 1],
+        ) orelse return error.InvalidOp;
+        return .{ bl, kl, op };
+    }
+};
+
+pub const Request2 = struct {
+    pub const InvalidFrame = enum {
+        invalid_op,
+        key_too_big,
+        value_too_big,
+        malformed,
+    };
+
+    pub fn validateFrame(
+        frame: [frame_size]u8,
+        err_reason: ?*InvalidFrame,
+    ) bool {
+        const op = parseFrameOp(frame, err_reason) catch {
+            return false;
+        };
+
+        const kl = frameKeyLen(frame);
+        const bl = frameBodyLen(frame);
+
+        if (kl > bl) {
+            if (err_reason) |r| r.* = .malformed;
+            return false;
+        }
+
+        const vl = bl - kl;
+
+        if (kl > max_key_size) {
+            if (err_reason) |r| r.* = .key_too_big;
+            return false;
+        }
+
+        if (vl > max_value_size) {
+            if (err_reason) |r| r.* = .value_too_big;
+            return false;
+        }
+
+        if (kl == 0) {
+            if (err_reason) |r| r.* = .malformed;
+            return false;
+        }
+
+        if (((op == Op.get or op == Op.del) and kl != bl)) {
+            if (err_reason) |r| r.* = .malformed;
+            return false;
+        }
+
+        return true;
+    }
+
+    pub inline fn frameBodyLen(frame: [frame_size]u8) usize {
+        return @intCast(mem.readInt(u32, frame[0..@sizeOf(u32)], .big));
+    }
+
+    pub inline fn frameKeyLen(frame: [frame_size]u8) usize {
+        return @intCast(mem.readInt(u32, frame[@sizeOf(u32) .. 2 * @sizeOf(u32)], .big));
+    }
+
+    pub inline fn frameValueLen(frame: [frame_size]u8) usize {
+        return frameBodyLen(frame) - frameKeyLen(frame);
+    }
+
+    pub inline fn frameOp(frame: [frame_size]u8) Op {
+        return @enumFromInt(frame[8]);
+    }
+
+    fn parseFrameOp(frame: [frame_size]u8, err_reason: ?*InvalidFrame) error{InvalidOp}!Op {
+        if (std.enums.fromInt(Op, frame[8])) |op| {
+            return op;
+        } else {
+            if (err_reason) |r| r.* = .invalid_op;
+            return error.InvalidOp;
+        }
     }
 };
 
