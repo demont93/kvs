@@ -24,6 +24,8 @@ const syscall = @import("syscall.zig");
 
 const Self = @This();
 
+const log = std.log.scoped(.server);
+
 /// Assumes that the process is single threaded. If the server gets more threads, the signal may
 /// land in any thread. While the variable will be set, the poll or connect may not get INTR'd.
 var stop: std.atomic.Value(bool) = .init(false);
@@ -126,7 +128,7 @@ pub const Listener = struct {
             switch (linux.errno(rc)) {
                 .SUCCESS, .INTR => {},
                 .BADF => |e| syscall.errnoBug("close", e),
-                else => |e| logErr("closing connection", e),
+                else => |e| logErr_deprecated("closing connection", e),
             }
             self.sock_fd = -1;
             return;
@@ -190,10 +192,8 @@ pub const Listener = struct {
     }
 
     pub const AcceptError = error{
-        Aborted,
-        InsufficientMemory,
-        TooManyOpenFiles,
-        Firewall,
+        SystemResources,
+        ConnectionFailed,
         Stop,
     };
 
@@ -212,18 +212,26 @@ pub const Listener = struct {
             );
             const conn_sock_fd: i32 = switch (linux.errno(accept_rc)) {
                 .SUCCESS => @intCast(accept_rc),
-                .CONNABORTED => return AcceptError.Aborted,
                 .INTR => continue,
-                .MFILE, .NFILE => return AcceptError.TooManyOpenFiles,
-                .NOBUFS, .NOMEM => return AcceptError.InsufficientMemory,
-                .PERM => return AcceptError.Firewall,
+                .MFILE, .NFILE, .NOBUFS, .NOMEM => |e| {
+                    log.warn("accept: {t}", .{e});
+                    return AcceptError.SystemResources;
+                },
+                .PERM, .CONNABORTED => |e| {
+                    log.warn("accept: {t}", .{e});
+                    return AcceptError.ConnectionFailed;
+                },
                 .NETDOWN,
                 .NOPROTOOPT,
                 .HOSTDOWN,
                 .NONET,
                 .HOSTUNREACH,
                 .NETUNREACH,
-                => continue,
+                => |e| {
+                    log.info("accept: {t}", .{e});
+                    log.info("retrying...", {});
+                    continue;
+                },
                 .BADF,
                 .FAULT,
                 .INVAL,
@@ -232,7 +240,7 @@ pub const Listener = struct {
                 .AGAIN,
                 => |e| syscall.errnoBug("accept", e),
                 else => |e| {
-                    logErr("unexpected accept error", e);
+                    log.err("accept: unexpected_error={t}", .{e});
                     continue;
                 },
             };
@@ -248,7 +256,7 @@ pub const Listener = struct {
             switch (linux.errno(close_rc)) {
                 .SUCCESS, .INTR => {},
                 .BADF => |e| syscall.errnoBug("close", e),
-                else => |e| logErr("closing listener", e),
+                else => |e| logErr_deprecated("closing listener", e),
             }
         }
     }
@@ -674,7 +682,7 @@ const RetryState = struct {
         if (self.backoff < max_backoff) self.backoff *= 2;
     }
 
-    fn reset(self: *RetryState) void {
+    fn resetBackoff(self: *RetryState) void {
         self.backoff = initial_backoff;
     }
 };
@@ -712,21 +720,21 @@ pub fn serve(self: *Self) void {
 
     while (true) {
         var conn = if (self.listener.accept()) |conn| blk: {
-            self.retry_state.reset();
+            self.retry_state.resetBackoff();
             break :blk conn;
-        } else |err| {
-            if (err == error.Stop) {
-                std.debug.print("stopping the server\n", .{});
-            } else {
-                debug.print("error accepting connection: {s}\n", .{@errorName(err)});
-            }
-
-            switch (err) {
-                error.InsufficientMemory, error.TooManyOpenFiles => self.retry_state.wait(self.io),
-                error.Stop => return,
-                else => self.retry_state.reset(),
-            }
-            continue;
+        } else |err| switch (err) {
+            error.Stop => {
+                log.info("stopping the server", .{});
+                return;
+            },
+            error.ConnectionFailed => {
+                self.retry_state.resetBackoff();
+                continue;
+            },
+            error.SystemResources => {
+                self.retry_state.wait(self.io);
+                continue;
+            },
         };
 
         const result = self.handleConnection(&conn, &diag);
@@ -734,11 +742,11 @@ pub fn serve(self: *Self) void {
         result catch |e| {
             switch (e) {
                 error.IdleTimeout => {},
-                error.Unexpected => log(
+                error.Unexpected => log_deprecated(
                     "connection error: unexpected {t}",
                     .{self.unexpected_errno},
                 ),
-                error.Stop => return log("request stopped\n", .{}),
+                error.Stop => return log_deprecated("request stopped\n", .{}),
                 else => debug.print(
                     "connection error {t} while {s}\n",
                     .{ diag.details, diag.action.description() },
@@ -1067,7 +1075,7 @@ fn drain(self: *Self, conn: *Listener.Connection) void {
         ) catch |e| switch (e) {
             error.Timeout, error.Unexpected => return,
             error.TooManyPollFds => syscall.zerrnoBug("poll", e),
-            error.OutOfMemory => log("OutOfMemory when draining request\n", .{}),
+            error.OutOfMemory => log_deprecated("OutOfMemory when draining request\n", .{}),
         };
 
         const n = conn.read(self.drain_buf[i..], &self.unexpected_errno) catch return;
@@ -1153,11 +1161,11 @@ fn now(self: Self) Clock.Timestamp {
     return Clock.Timestamp.now(self.io, Clock);
 }
 
-fn log(comptime fmt: []const u8, args: anytype) void {
+fn log_deprecated(comptime fmt: []const u8, args: anytype) void {
     debug.print(fmt, args);
 }
 
-fn logErr(msg: []const u8, e: anytype) void {
+fn logErr_deprecated(msg: []const u8, e: anytype) void {
     debug.print("{s}: {t}\n", .{ msg, e });
 }
 
