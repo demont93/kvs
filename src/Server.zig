@@ -715,81 +715,6 @@ pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{O
     installSigHandler();
 }
 
-pub fn serve(self: *Self) void {
-    var diag: ConnectionDiagnostics = undefined;
-
-    while (true) {
-        var conn = if (self.listener.accept()) |conn| blk: {
-            self.retry_state.resetBackoff();
-            break :blk conn;
-        } else |err| switch (err) {
-            error.Stop => {
-                log.info("stopping the server", .{});
-                return;
-            },
-            error.ConnectionFailed => {
-                self.retry_state.resetBackoff();
-                continue;
-            },
-            error.SystemResources => {
-                self.retry_state.wait(self.io);
-                continue;
-            },
-        };
-
-        const result = self.handleConnection(&conn, &diag);
-        conn.close();
-        result catch |e| {
-            switch (e) {
-                error.IdleTimeout => {},
-                error.Unexpected => log_deprecated(
-                    "connection error: unexpected {t}",
-                    .{self.unexpected_errno},
-                ),
-                error.Stop => return log_deprecated("request stopped\n", .{}),
-                else => debug.print(
-                    "connection error {t} while {s}\n",
-                    .{ diag.details, diag.action.description() },
-                ),
-            }
-        };
-    }
-}
-
-pub fn listenAndServe(
-    self: *Self,
-    addr: []const u8,
-) void {
-    self.bind(addr) catch |e| {
-        debug.print("failed to bind to address {s}: {s}\n", .{ addr, @errorName(e) });
-        return;
-    };
-
-    var localaddr: linux.sockaddr.in = undefined;
-    self.localAddr(&localaddr) catch |e| {
-        debug.print("failed to get local address: {s}\n", .{@errorName(e)});
-        return;
-    };
-
-    const addr_str = formatAddr(localaddr);
-    debug.print("Listening and serving on {s}\n", .{std.mem.span(addr_str[0..].ptr)});
-
-    self.serve();
-}
-
-pub fn bind(self: *Self, addr: []const u8) Listener.BindError!void {
-    return self.listener.bind(addr);
-}
-
-fn listenAndServeOne(
-    self: *Self,
-    diag: *ConnectionDiagnostics,
-) (RequestError || Listener.AcceptError)!void {
-    var conn = try self.listener.accept();
-    defer conn.close();
-    try self.handleConnection(&conn, diag);
-}
-
 pub fn close(self: *Self) void {
     self.request_bufs.deinit(self.allocator);
     self.listener.close();
@@ -822,6 +747,84 @@ fn installSigHandler() void {
 fn sigHandler(signal: linux.SIG) callconv(.c) void {
     _ = signal;
     stop.store(true, .monotonic);
+}
+
+pub fn listenAndServe(
+    self: *Self,
+    addr: []const u8,
+) void {
+    self.bind(addr) catch |e| {
+        debug.print("failed to bind to address {s}: {s}\n", .{ addr, @errorName(e) });
+        return;
+    };
+
+    var localaddr: linux.sockaddr.in = undefined;
+    self.localAddr(&localaddr) catch |e| {
+        debug.print("failed to get local address: {s}\n", .{@errorName(e)});
+        return;
+    };
+
+    const addr_str = formatAddr(localaddr);
+    debug.print("Listening and serving on {s}\n", .{std.mem.span(addr_str[0..].ptr)});
+
+    self.serve();
+}
+
+fn listenAndServeOne(
+    self: *Self,
+    diag: *ConnectionDiagnostics,
+) (RequestError || Listener.AcceptError)!void {
+    var conn = try self.listener.accept();
+    defer conn.close();
+    try self.handleConnection(&conn, diag);
+}
+
+pub fn serve(self: *Self) void {
+    var diag: ConnectionDiagnostics = undefined;
+
+    while (true) {
+        var conn = if (self.listener.accept()) |conn| blk: {
+            self.retry_state.resetBackoff();
+            break :blk conn;
+        } else |err| switch (err) {
+            error.Stop => {
+                log.info("stopping the server", .{});
+                return;
+            },
+            error.ConnectionFailed => {
+                self.retry_state.resetBackoff();
+                continue;
+            },
+            error.SystemResources => {
+                self.retry_state.wait(self.io);
+                continue;
+            },
+        };
+
+        const result = self.handleConnection(&conn, &diag);
+        conn.close();
+        result catch |e| {
+            switch (e) {
+                error.IdleTimeout => {},
+                error.Unexpected => log_deprecated(
+                    "connection error: unexpected {t}",
+                    .{self.unexpected_errno},
+                ),
+                error.Stop => {
+                    log.info("stopping the server", .{});
+                    return;
+                },
+                else => debug.print(
+                    "connection error {t} while {s}\n",
+                    .{ diag.details, diag.action.description() },
+                ),
+            }
+        };
+    }
+}
+
+pub fn bind(self: *Self, addr: []const u8) Listener.BindError!void {
+    return self.listener.bind(addr);
 }
 
 const RequestError = error{
