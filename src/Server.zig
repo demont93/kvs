@@ -35,7 +35,6 @@ read_timeout: Io.Duration,
 write_timeout: Io.Duration,
 idle_timeout: Io.Duration,
 grace_period: Io.Duration,
-parser: protocol.Parser,
 allocator: Allocator,
 retry_state: RetryState,
 unexpected_errno: linux.E,
@@ -294,7 +293,7 @@ const RequestBuffers = struct {
     err_reason: ?Diagnostics,
 
     const Diagnostics = union(enum) {
-        parse: protocol.Request2.InvalidFrame,
+        parse: protocol.Request.InvalidFrame,
         oom,
     };
 
@@ -418,7 +417,7 @@ const RequestBuffers = struct {
         assert(self.stage == .kv);
 
         const req: Request = .{
-            .op = protocol.Request2.frameOp(self.frame_buffer),
+            .op = protocol.Request.frameOp(self.frame_buffer),
             .key = self.key_buf.?,
             .value = self.value_buf,
         };
@@ -497,20 +496,20 @@ const RequestBuffers = struct {
     fn transitionKvStage(self: *RequestBuffers, allocator: Allocator) bool {
         self.stage = .kv;
 
-        var reason: protocol.Request2.InvalidFrame = undefined;
-        if (!protocol.Request2.validateFrame(self.frame_buffer, &reason)) {
+        var reason: protocol.Request.InvalidFrame = undefined;
+        if (!protocol.Request.validateFrame(self.frame_buffer, &reason)) {
             self.err_reason = .{ .parse = reason };
             return false;
         }
 
-        const kl = protocol.Request2.frameKeyLen(self.frame_buffer);
+        const kl = protocol.Request.frameKeyLen(self.frame_buffer);
         self.key_buf = allocator.alloc(u8, kl) catch {
             self.err_reason = .oom;
             return false;
         };
         self.key = .initBuffer(self.key_buf.?);
 
-        const vl = protocol.Request2.frameValueLen(self.frame_buffer);
+        const vl = protocol.Request.frameValueLen(self.frame_buffer);
         if (vl > 0) {
             self.value_buf = allocator.alloc(u8, vl) catch {
                 self.err_reason = .oom;
@@ -567,7 +566,7 @@ const RequestBuffers = struct {
         try testing.expect(rb.done());
         var diag: Diagnostics = undefined;
         try testing.expectEqual(null, rb.claimRequest(testing.allocator, &diag));
-        try testing.expectEqual(protocol.Request2.InvalidFrame.malformed, diag.parse);
+        try testing.expectEqual(protocol.Request.InvalidFrame.malformed, diag.parse);
 
         rb.reset(testing.allocator);
         const region2 = rb.writeRegion();
@@ -700,8 +699,6 @@ pub fn init(self: *Self, allocator: Allocator, io: Io, opts: ServerOpts) error{O
     self.write_timeout = opts.write_timeout;
     self.idle_timeout = opts.idle_timeout;
     self.grace_period = opts.grace_period;
-
-    self.parser = .{};
 
     self.map = BufMap.init(allocator);
 
@@ -1034,76 +1031,6 @@ fn readConnection(
             break;
         }
     };
-}
-
-const ParseError = error{
-    OutOfMemory,
-    BadRequest,
-};
-
-fn handleParseErr(err: protocol.ParseError, diag: *ConnectionDiagnostics) ParseError {
-    const e = switch (err) {
-        error.InvalidRequest, error.UnexpectedBytes, error.EmptyRequest => error.BadRequest,
-        error.OutOfMemory => |e| e,
-        error.RequestBufInitialized => @panic("request buffer started initialized"),
-    };
-    diag.record(.parse, err);
-    return e;
-}
-
-const ReadError = error{
-    ReadTimeout,
-    OutOfMemory,
-    ConnectionReset,
-    Unexpected,
-    Stop,
-};
-
-fn readBuffered(
-    self: *Self,
-    conn: *Listener.Connection,
-    size: usize,
-    deadline: Io.Clock.Timestamp,
-) ReadError![]u8 {
-    var chunk = self.read_buf.contents(size);
-    if (chunk.len == 0) {
-        var pollfd = syscall.pollfd(conn.sock_fd, linux.POLL.IN);
-
-        var n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
-            error.WouldBlock => 0,
-            else => |e| return e,
-        };
-
-        if (n == 0) {
-            const pollfds: *[1]linux.pollfd = &pollfd;
-            while (true) {
-                if (stop.load(.monotonic)) {
-                    return error.Stop;
-                }
-                _ = syscall.pollintr(
-                    self.io,
-                    pollfds,
-                    deadline,
-                    &self.unexpected_errno,
-                ) catch |e| return switch (e) {
-                    error.Timeout => error.ReadTimeout,
-                    error.TooManyPollFds => syscall.zerrno_bug("poll", e),
-                    error.Intr => continue,
-                    else => |e2| return e2,
-                };
-                break;
-            }
-
-            n = conn.read(self.read_buf.write(), &self.unexpected_errno) catch |e| switch (e) {
-                error.Unexpected => |err| return err,
-                error.WouldBlock => syscall.errnoBug("read", linux.E.AGAIN),
-                else => |e| return e,
-            };
-        }
-        self.read_buf.markWritten(n);
-        chunk = self.read_buf.contents(size);
-    }
-    return chunk;
 }
 
 fn timeout_remaining_ms(self: Self, deadline: Io.Clock.Timestamp) ?i32 {
