@@ -41,7 +41,6 @@ idle_timeout: Duration,
 grace_period: Duration,
 allocator: Allocator,
 retry_state: RetryState,
-unexpected_errno: linux.E,
 
 map: BufMap,
 
@@ -51,37 +50,42 @@ pub const Listener = struct {
         sock_fd: i32 = -1,
 
         pub const RwError = error{
-            ConnectionReset,
+            ConnectionUnusable,
             WouldBlock,
-            Unexpected,
         };
 
-        pub fn readv(self: *Connection, iovs: []iovec, unexpected: *linux.E) RwError!usize {
+        pub fn readv(self: *Connection, iovs: []iovec) RwError!usize {
             while (true) {
                 const readv_rc = linux.readv(self.sock_fd, iovs.ptr, iovs.len);
                 switch (linux.errno(readv_rc)) {
                     .SUCCESS => return readv_rc,
                     .INTR => continue,
-                    .CONNRESET, .PIPE => return RwError.ConnectionReset,
                     .AGAIN => return RwError.WouldBlock,
                     .BADF,
                     .FAULT,
                     .NOTSOCK,
                     .INVAL,
                     .NOTCONN,
-                    => |e| syscall.errnoBug("read", e),
-                    else => |e| return syscall.recordUnexpectedErrno(unexpected, e),
+                    => |e| syscall.errnoBug("readv", e),
+                    .CONNRESET, .PIPE => |e| {
+                        log.warn("connection readv: {t}", .{e});
+                        return RwError.ConnectionUnusable;
+                    },
+                    else => |e| {
+                        log.err("connection readv: unexpected error {t}", .{e});
+                        return RwError.ConnectionUnusable;
+                    },
                 }
             }
         }
 
-        pub fn read(self: *Connection, buf: []u8, unexpected: *linux.E) RwError!usize {
+        pub fn read(self: *Connection, buf: []u8) RwError!usize {
             while (true) {
                 const read_rc = linux.read(self.sock_fd, buf.ptr, buf.len);
                 switch (linux.errno(read_rc)) {
                     .SUCCESS => return read_rc,
                     .INTR => continue,
-                    .CONNRESET, .PIPE => return RwError.ConnectionReset,
+                    .CONNRESET, .PIPE => return RwError.ConnectionUnusable,
                     .AGAIN => return RwError.WouldBlock,
                     .BADF,
                     .FAULT,
@@ -89,7 +93,10 @@ pub const Listener = struct {
                     .INVAL,
                     .NOTCONN,
                     => |e| syscall.errnoBug("read", e),
-                    else => |e| return syscall.recordUnexpectedErrno(unexpected, e),
+                    else => |e| {
+                        log.err("connection read: unexpected error {t}", .{e});
+                        return RwError.ConnectionUnusable;
+                    },
                 }
             }
         }
@@ -228,8 +235,7 @@ pub const Listener = struct {
                 .HOSTUNREACH,
                 .NETUNREACH,
                 => |e| {
-                    log.info("accept: {t}", .{e});
-                    log.info("retrying...", {});
+                    log.warn("accept: {t}", .{e});
                     continue;
                 },
                 .BADF,
@@ -240,7 +246,7 @@ pub const Listener = struct {
                 .AGAIN,
                 => |e| syscall.errnoBug("accept", e),
                 else => |e| {
-                    log.err("accept: unexpected_error={t}", .{e});
+                    log.err("accept: unexpected error {t}", .{e});
                     continue;
                 },
             };
@@ -656,20 +662,6 @@ const Action = enum {
     }
 };
 
-const ConnectionDiagnostics = struct {
-    action: Action,
-    details: anyerror,
-
-    fn record(
-        self: *ConnectionDiagnostics,
-        action: Action,
-        details: anyerror,
-    ) void {
-        self.action = action;
-        self.details = details;
-    }
-};
-
 const RetryState = struct {
     const max_backoff: i32 = 1600;
     const initial_backoff: i32 = 200;
@@ -770,18 +762,17 @@ pub fn listenAndServe(
     self.serve();
 }
 
-fn listenAndServeOne(
-    self: *Self,
-    diag: *ConnectionDiagnostics,
-) (RequestError || Listener.AcceptError)!void {
+fn listenAndServeOne(self: *Self) Listener.AcceptError!void {
     var conn = try self.listener.accept();
     defer conn.close();
-    try self.handleConnection(&conn, diag);
+    try self.handleConnection(&conn);
+}
+
+pub fn bind(self: *Self, addr: []const u8) Listener.BindError!void {
+    return self.listener.bind(addr);
 }
 
 pub fn serve(self: *Self) void {
-    var diag: ConnectionDiagnostics = undefined;
-
     while (true) {
         var conn = if (self.listener.accept()) |conn| blk: {
             self.retry_state.resetBackoff();
@@ -801,108 +792,91 @@ pub fn serve(self: *Self) void {
             },
         };
 
-        const result = self.handleConnection(&conn, &diag);
+        const result = self.handleConnection(&conn);
         conn.close();
         result catch |e| {
             switch (e) {
-                error.IdleTimeout => {},
-                error.Unexpected => log_deprecated(
-                    "connection error: unexpected {t}",
-                    .{self.unexpected_errno},
-                ),
                 error.Stop => {
                     log.info("stopping the server", .{});
                     return;
                 },
-                else => debug.print(
-                    "connection error {t} while {s}\n",
-                    .{ diag.details, diag.action.description() },
-                ),
             }
         };
     }
 }
 
-pub fn bind(self: *Self, addr: []const u8) Listener.BindError!void {
-    return self.listener.bind(addr);
+fn handleConnection(self: *Self, conn: *Listener.Connection) error{Stop}!void {
+    defer self.request_bufs.reset(self.allocator);
+    var should_continue = true;
+
+    while (should_continue) {
+        should_continue = try self.handleRequest(conn);
+    }
 }
 
-const RequestError = error{
-    ConnectionReset,
-    ReadTimeout,
-    WriteTimeout,
-    IdleTimeout,
-    OutOfMemory,
-    BadRequest,
-    Unexpected,
+fn handleRequest(self: *Self, conn: *Listener.Connection) error{Stop}!bool {
+    const resp, const free = self.handleRequestBeforeWrite(conn) catch |err| switch (err) {
+        error.Stop => |e| return e,
+        error.Finished => return false,
+        error.ConnectionUnusable => {
+            log.info("connection: unusable", .{});
+            return false;
+        },
+        else => |respond_err| {
+            log.info("connection: {t}", .{respond_err});
+            const err_response = switch (respond_err) {
+                error.SystemResources => response.internal,
+                error.BadRequest => response.invalid,
+                error.Timeout => response.timeout,
+            };
+            self.writeDrain(conn, err_response);
+            return false;
+        },
+    };
+    defer if (free) self.allocator.free(resp);
+
+    self.writeAll(conn, resp) catch |err| switch (err) {
+        error.ConnectionUnusable => {
+            log.info("connection: unusable", .{});
+            return false;
+        },
+        error.Timeout => {
+            log.info("connection: write timeout", .{});
+            return false;
+        },
+    };
+
+    return true;
+}
+
+const BeforeWriteError = error{
+    Timeout,
+    SystemResources,
     Stop,
+    ConnectionUnusable,
+    BadRequest,
     Finished,
 };
 
-fn handleConnection(
+fn handleRequestBeforeWrite(
     self: *Self,
     conn: *Listener.Connection,
-    diag: *ConnectionDiagnostics,
-) RequestError!void {
-    var result: RequestResult = .cont;
-    defer self.request_bufs.reset(self.allocator);
-    while (result == .cont) {
-        result = try self.handleRequest(conn, diag);
-    }
+) BeforeWriteError!struct { []const u8, bool } {
+    const req = try self.readRequest(conn);
+
+    return self.handler(req) catch |e| {
+        log.warn("request handler: {t}", .{e});
+        return error.SystemResources;
+    };
 }
 
-const RequestResult = enum {
-    done,
-    cont,
-};
-
-fn handleRequest(
-    self: *Self,
-    conn: *Listener.Connection,
-    diag: *ConnectionDiagnostics,
-) RequestError!RequestResult {
-    const req = self.readRequest(conn, diag) catch |err| {
-        const error_response = switch (err) {
-            error.Finished => return .done,
-            error.ConnectionReset, error.Unexpected, error.Stop => |e| return e,
-            error.OutOfMemory => response.internal,
-            error.BadRequest => response.invalid,
-            error.ReadTimeout, error.IdleTimeout => response.timeout,
-        };
-        self.writeDrain(conn, error_response);
-        return err;
-    };
-
-    const resp, const free = self.handler(req, diag) catch |e| {
-        self.writeDrain(conn, response.internal);
-        return e;
-    };
-    defer {
-        if (free) self.allocator.free(resp);
-    }
-
-    self.writeAll(conn, resp) catch |err| {
-        diag.record(.write, err);
-        return @errorCast(err);
-    };
-
-    return .cont;
-}
-
-fn handler(
-    self: *Self,
-    req: Request,
-    diag: *ConnectionDiagnostics,
-) !struct { []const u8, bool } {
+fn handler(self: *Self, req: Request) error{OutOfMemory}!struct { []const u8, bool } {
     switch (req.op) {
         .get => {
             defer self.allocator.free(req.key);
 
             if (self.map.get(req.key)) |v| {
-                const msg = response.value(self.allocator, v) catch |err| {
-                    diag.record(.encode, err);
-                    return err;
-                };
+                const msg = try response.value(self.allocator, v);
                 return .{ msg, true };
             } else {
                 return .{ response.not_found, false };
@@ -925,7 +899,6 @@ fn handler(
             } else |e| {
                 self.allocator.free(req.key);
                 self.allocator.free(req.value.?);
-                diag.record(.handler, e);
                 return e;
             }
         },
@@ -933,37 +906,33 @@ fn handler(
 }
 
 const ReadRequestError = error{
-    ConnectionReset,
-    OutOfMemory,
+    ConnectionUnusable,
+    SystemResources,
     BadRequest,
-    ReadTimeout,
-    IdleTimeout,
-    Unexpected,
+    Timeout,
     Stop,
     Finished,
-};
-
-const Stoppable = enum {
-    stoppable,
-    non_stoppable,
 };
 
 fn readRequest(
     self: *Self,
     conn: *Listener.Connection,
-    diag: *ConnectionDiagnostics,
 ) ReadRequestError!Request {
     const idle_deadline = self.makeDeadline(self.idle_timeout);
     var fds: [1]linux.pollfd = .{syscall.pollfd(conn.sock_fd, linux.POLL.IN)};
 
     if (!self.request_bufs.done()) {
-        const n_read = self.readConnection(conn, &fds, idle_deadline, .stoppable) catch |err| {
-            const e = switch (err) {
-                error.Stop, error.Unexpected, error.OutOfMemory, error.ConnectionReset => |e| e,
-                error.Timeout => error.IdleTimeout,
-            };
-            diag.record(.first_read, e);
-            return e;
+        const n_read = self.readConnection(
+            conn,
+            &fds,
+            idle_deadline,
+            .stoppable,
+        ) catch |err| switch (err) {
+            error.Timeout => |e| {
+                log.info("read request: idle connection timeout", .{});
+                return e;
+            },
+            else => |e| return e,
         };
 
         if (n_read == 0) {
@@ -976,18 +945,21 @@ fn readRequest(
     const read_deadline = self.makeDeadline(self.read_timeout);
 
     while (!self.request_bufs.done()) {
-        const n_read = self.readConnection(conn, &fds, read_deadline, .non_stoppable) catch |err| {
-            const e = switch (err) {
-                error.Stop => |e| return e,
-                error.Unexpected, error.OutOfMemory, error.ConnectionReset => |e| e,
-                error.Timeout => error.ReadTimeout,
-            };
-            diag.record(.subsequent_reads, e);
-            return e;
+        const n_read = self.readConnection(
+            conn,
+            &fds,
+            read_deadline,
+            .non_stoppable,
+        ) catch |err| switch (err) {
+            error.Timeout => |e| {
+                log.info("read request: read timeout", .{});
+                return e;
+            },
+            else => |e| return e,
         };
 
         if (n_read == 0) {
-            diag.record(.subsequent_reads, error.UnexpectedEof);
+            log.debug("read request: unexpected end of file", .{});
             return error.BadRequest;
         }
 
@@ -997,20 +969,29 @@ fn readRequest(
     var rb_diag: RequestBuffers.Diagnostics = undefined;
     return self.request_bufs.claimRequest(self.allocator, &rb_diag) orelse {
         const err = switch (rb_diag) {
-            .oom => error.OutOfMemory,
-            .parse => error.BadRequest,
+            .oom => blk: {
+                log.warn("parse request: out of memory", .{});
+                break :blk error.SystemResources;
+            },
+            .parse => |v| blk: {
+                log.debug("parse request: {t}", .{v});
+                break :blk error.BadRequest;
+            },
         };
-        diag.record(.subsequent_reads, err);
         return err;
     };
 }
 
 const ReadConnectionError = error{
-    ConnectionReset,
-    Unexpected,
+    ConnectionUnusable,
+    SystemResources,
     Timeout,
-    OutOfMemory,
     Stop,
+};
+
+const Stoppable = enum {
+    stoppable,
+    non_stoppable,
 };
 
 fn readConnection(
@@ -1022,11 +1003,11 @@ fn readConnection(
 ) ReadConnectionError!usize {
     return while (true) {
         const iovs = self.request_bufs.writeRegion().?;
-        const read_result = conn.readv(iovs, &self.unexpected_errno);
+        const read_result = conn.readv(iovs);
 
         if (read_result) |n| break n else |err| switch (err) {
             error.WouldBlock => {},
-            error.ConnectionReset, error.Unexpected => |e| return e,
+            else => |e| return e,
         }
 
         while (true) {
@@ -1035,27 +1016,29 @@ fn readConnection(
                 self.io,
                 fds,
                 deadline,
-                &self.unexpected_errno,
+                null,
             ) catch |err| switch (err) {
                 error.Intr => continue,
-                error.TooManyPollFds => return syscall.errnoBug("poll", linux.E.INVAL),
-                error.Timeout, error.OutOfMemory, error.Unexpected => |e| return e,
+                error.OutOfMemory, error.TooManyPollFds => |e| {
+                    log.warn("poll: {t}", .{e});
+                    return error.SystemResources;
+                },
+                error.Unexpected => return error.ConnectionUnusable,
+                else => |e| return e,
             };
             break;
         }
     };
 }
 
-fn timeout_remaining_ms(self: Self, deadline: Clock.Timestamp) ?i32 {
+fn timeoutRemainingMs(self: Self, deadline: Clock.Timestamp) ?i32 {
     const timeout = deadline.durationFromNow(self.io).raw.toMilliseconds();
     return if (timeout > 0) @intCast(timeout) else null;
 }
 
 const WriteError = error{
-    WriteTimeout,
-    OutOfMemory,
-    ConnectionReset,
-    Unexpected,
+    Timeout,
+    ConnectionUnusable,
 };
 
 /// Shuts down the write side of the connection. Caller must close after calling this.
@@ -1074,14 +1057,14 @@ fn drain(self: *Self, conn: *Listener.Connection) void {
             self.io,
             @as(*[1]linux.pollfd, &pollfd),
             deadline,
-            &self.unexpected_errno,
+            null,
         ) catch |e| switch (e) {
             error.Timeout, error.Unexpected => return,
             error.TooManyPollFds => syscall.zerrnoBug("poll", e),
             error.OutOfMemory => log_deprecated("OutOfMemory when draining request\n", .{}),
         };
 
-        const n = conn.read(self.drain_buf[i..], &self.unexpected_errno) catch return;
+        const n = conn.read(self.drain_buf[i..]) catch return;
         if (n == 0) return;
         i += n;
     }
@@ -1107,10 +1090,17 @@ fn writeAllPoll(
         buf,
         deadline,
         self.io,
-        &self.unexpected_errno,
-    ) catch |e| switch (e) {
-        error.Timeout => return error.WriteTimeout,
-        error.ConnectionReset, error.OutOfMemory, error.Unexpected => |e| return e,
+        null,
+    ) catch |err| switch (err) {
+        error.Timeout => |e| return e,
+        error.Unexpected => |e| {
+            log.err("write polling: unexpected error {t}", .{e});
+            return error.ConnectionUnusable;
+        },
+        error.ConnectionReset, error.OutOfMemory => |e| {
+            log.warn("write polling: {t}", .{e});
+            return error.ConnectionUnusable;
+        },
         else => |e| syscall.zerrnoBug("send | poll", e),
     };
 }
@@ -1193,10 +1183,7 @@ test "bind to a connection and read happy" {
         &response_buf,
     );
 
-    t.close() catch |e| {
-        debug.print("error {} while {s}\n", .{ t.diag.details, t.diag.action.description() });
-        return e;
-    };
+    try t.close();
 }
 
 test "slow writing client gets read timeout" {
@@ -1214,9 +1201,7 @@ test "slow writing client gets read timeout" {
         &[_]u8{ @intFromEnum(response.Code.Timeout), 0, 0, 0, 0 },
         &resp,
     );
-    try testing.expectError(error.ReadTimeout, t.close());
-    try testing.expectEqual(Action.subsequent_reads, t.diag.action);
-    try testing.expectEqual(error.ReadTimeout, t.diag.details);
+    try t.close();
 }
 
 test "slow reading client gets write timeout" {
@@ -1234,9 +1219,7 @@ test "slow reading client gets write timeout" {
     var r = t.client_reader();
     try r.interface.readSliceAll(&resp);
     try testing.io.sleep(.fromMilliseconds(400), .awake);
-    try testing.expectError(error.WriteTimeout, t.close());
-    try testing.expectEqual(Action.write, t.diag.action);
-    try testing.expectEqual(error.WriteTimeout, t.diag.details);
+    try t.close();
 }
 
 test "large invalid request gets rst" {
@@ -1248,9 +1231,7 @@ test "large invalid request gets rst" {
     @memset(large, 128);
     try testing.expectError(error.WriteFailed, w.interface.writeAll(large));
     try testing.expectEqual(error.SocketUnconnected, w.err.?);
-    try testing.expectError(error.BadRequest, t.close());
-    try testing.expectEqual(Action.subsequent_reads, t.diag.action);
-    try testing.expectEqual(error.BadRequest, t.diag.details);
+    try t.close();
 }
 
 test "a small invalid request closes gracefully" {
@@ -1266,9 +1247,7 @@ test "a small invalid request closes gracefully" {
     try r.interface.readSliceAll(&buf);
     var eofbuf: [1]u8 = undefined;
     try testing.expectError(error.EndOfStream, r.interface.readSliceAll(&eofbuf));
-    try testing.expectError(error.BadRequest, t.close());
-    try testing.expectEqual(Action.subsequent_reads, t.diag.action);
-    try testing.expectEqual(error.BadRequest, t.diag.details);
+    try t.close();
 }
 
 test "many requests on the same connection" {
@@ -1335,7 +1314,7 @@ test "idle connection timeout" {
     try testing.expectError(error.WriteFailed, w.interface.flush());
     try testing.expectEqual(error.SocketUnconnected, w.err.?);
 
-    try testing.expectError(error.IdleTimeout, t.close());
+    try t.close();
 }
 
 test "data doesn't leak into next connection" {
@@ -1372,7 +1351,6 @@ test "data doesn't leak into next connection" {
 const Tester = struct {
     server: Self,
     client: net.Stream,
-    diag: ConnectionDiagnostics,
     result: anyerror!void,
     thread_handle: ?Thread,
     io: Io,
@@ -1390,7 +1368,7 @@ const Tester = struct {
         self.thread_handle = try Thread.spawn(
             .{},
             server_thread,
-            .{ &self.server, &self.result, &self.diag },
+            .{ &self.server, &self.result },
         );
 
         var addr: linux.sockaddr.in = undefined;
@@ -1480,7 +1458,7 @@ const Tester = struct {
         self.thread_handle = try Thread.spawn(
             .{},
             server_thread,
-            .{ &self.server, &self.result, &self.diag },
+            .{ &self.server, &self.result },
         );
 
         var addr: linux.sockaddr.in = undefined;
@@ -1502,7 +1480,7 @@ const Tester = struct {
         return r;
     }
 
-    fn server_thread(server: *Self, result: *anyerror!void, diag: *ConnectionDiagnostics) void {
-        result.* = server.listenAndServeOne(diag);
+    fn server_thread(server: *Self, result: *anyerror!void) void {
+        result.* = server.listenAndServeOne();
     }
 };
